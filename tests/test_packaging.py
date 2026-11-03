@@ -349,3 +349,39 @@ def test_proxy_reports_unreachable_service_as_jsonrpc_error(monkeypatch):
     assert len(replies) == 1
     assert replies[0]["id"] == 7
     assert "unreachable" in replies[0]["error"]["message"]
+
+
+def test_ensure_running_reports_a_startup_crash_with_its_output(monkeypatch, tmp_path):
+    import subprocess as sp
+
+    from catia_mcp import service
+
+    monkeypatch.setenv("CATIA_MCP_HOME", str(tmp_path))
+    monkeypatch.setattr(service, "health", lambda *a, **k: None)
+
+    def crashing(port):
+        service.start_log_path().write_text("ImportError: DLL load failed: pywintypes\n")
+        return sp.Popen(["python3", "-c", "raise SystemExit(3)"])
+
+    monkeypatch.setattr(service, "start_detached", crashing)
+    with pytest.raises(RuntimeError) as error:
+        service.ensure_running(8765, wait=10)
+    assert "exit code 3" in str(error.value) and "DLL load failed" in str(error.value)
+
+
+def test_install_still_configures_clients_when_the_service_is_slow(monkeypatch, tmp_path):
+    from catia_mcp import service
+
+    monkeypatch.setattr(service, "set_autostart", lambda *a: "autostart")
+    monkeypatch.setattr(service, "health", lambda *a, **k: None)
+
+    def slow(port):
+        raise RuntimeError("did not answer")
+
+    monkeypatch.setattr(service, "ensure_running", slow)
+    config = tmp_path / "claude_desktop_config.json"
+    monkeypatch.setattr(service, "claude_desktop_configs", lambda: [config])
+    monkeypatch.setattr(service, "configure_claude_code", lambda port: "claude code")
+    lines = service.install(8765)
+    assert any(line.startswith("SERVICE NOT RUNNING") for line in lines)
+    assert config.exists()

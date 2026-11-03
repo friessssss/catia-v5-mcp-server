@@ -625,6 +625,8 @@ def main(argv: list[str] | None = None) -> None:
         else:
             lines = service.status_lines(args.port)
         print("\n".join(lines))
+        if any(line.startswith("SERVICE NOT RUNNING") for line in lines):
+            sys.exit(1)
         return
     if command == "proxy":
         from catia_mcp.proxy import run_proxy

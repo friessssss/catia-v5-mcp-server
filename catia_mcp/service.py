@@ -125,6 +125,10 @@ def serve_command(port: int = DEFAULT_PORT) -> list[str]:
     return [_pythonw(), "-m", "catia_mcp", "serve", "--port", str(port)]
 
 
+def start_log_path() -> Path:
+    return state_dir() / "service-start.log"
+
+
 def start_detached(port: int = DEFAULT_PORT) -> subprocess.Popen:
     flags = 0
     if os.name == "nt":
@@ -133,35 +137,67 @@ def start_detached(port: int = DEFAULT_PORT) -> subprocess.Popen:
             | subprocess.CREATE_NEW_PROCESS_GROUP
             | subprocess.CREATE_NO_WINDOW
         )
-    return subprocess.Popen(
-        serve_command(port),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=flags,
-        close_fds=True,
-        # Not the caller's directory: `-m` puts the working directory first on
-        # sys.path, where a checkout or stray .py file would shadow modules.
-        cwd=str(state_dir()),
-        start_new_session=os.name != "nt",
+    # The child's own stdout/stderr go to a file: a crash before logging is
+    # configured (import error, bad DLL) would otherwise leave no trace.
+    with open(start_log_path(), "wb") as console:
+        return subprocess.Popen(
+            serve_command(port),
+            stdin=subprocess.DEVNULL,
+            stdout=console,
+            stderr=subprocess.STDOUT,
+            creationflags=flags,
+            close_fds=True,
+            # Not the caller's directory: `-m` puts the working directory first
+            # on sys.path, where a checkout or stray .py file would shadow modules.
+            cwd=str(state_dir()),
+            start_new_session=os.name != "nt",
+        )
+
+
+def _tail(path: Path, lines: int = 25) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "(no file)"
+    return "\n".join(text.splitlines()[-lines:]) or "(empty)"
+
+
+def start_diagnostics() -> str:
+    return (
+        f"--- {start_log_path()} ---\n{_tail(start_log_path())}\n"
+        f"--- {log_path()} (last lines) ---\n{_tail(log_path(), 15)}"
     )
 
 
-def ensure_running(port: int = DEFAULT_PORT, wait: float = 20.0) -> dict:
+# The first start after an install compiles every module while antivirus
+# scans each file, which can take far longer than later starts.
+START_WAIT_S = 120.0
+
+
+def ensure_running(port: int = DEFAULT_PORT, wait: float = START_WAIT_S) -> dict:
     """Return the service's health, starting it first if nothing answers."""
     status = health(port)
     if status is not None:
         return status
-    start_detached(port)
+    process = start_detached(port)
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
         time.sleep(0.25)
         status = health(port, timeout=1.0)
         if status is not None:
             return status
+        code = process.poll()
+        if code is not None:
+            status = health(port, timeout=1.0)  # lost a start race to another instance
+            if status is not None:
+                return status
+            raise RuntimeError(
+                f"The CATIA MCP service exited during startup (exit code {code}).\n"
+                + start_diagnostics()
+            )
     raise RuntimeError(
-        f"The CATIA MCP service did not start on port {port} within {wait:.0f} s. "
-        f"See the log at {log_path()}."
+        f"The CATIA MCP service did not answer on port {port} within {wait:.0f} s "
+        f"(still starting: PID {process.pid}).\n" + start_diagnostics()
     )
 
 
@@ -321,8 +357,13 @@ def install(port: int = DEFAULT_PORT, configure_clients: bool = True) -> list[st
     lines.append(set_autostart(True, port))
     if health(port) is not None:
         lines.append(stop(port))  # restart onto the freshly installed code
-    status = ensure_running(port)
-    lines.append(f"Service running: {mcp_url(port)} (PID {status.get('pid')}).")
+    try:
+        status = ensure_running(port)
+        lines.append(f"Service running: {mcp_url(port)} (PID {status.get('pid')}).")
+    except RuntimeError as error:
+        # Configure the clients anyway: their proxy starts the service on
+        # first use, and the error below says why it is not up yet.
+        lines.append(f"SERVICE NOT RUNNING: {error}")
     if configure_clients:
         configs = claude_desktop_configs()
         if not configs:

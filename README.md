@@ -171,7 +171,7 @@ claude mcp add --scope user --transport http catia http://127.0.0.1:8765/mcp
 {
   "mcpServers": {
     "catia": {
-      "command": "C:\\Users\\you\\AppData\\Roaming\\uv\\data\\tools\\catia-v5-mcp-server\\Scripts\\python.exe",
+      "command": "C:\\Users\\you\\AppData\\Roaming\\uv\\tools\\catia-v5-mcp-server\\Scripts\\python.exe",
       "args": ["-m", "catia_mcp", "proxy"]
     }
   }

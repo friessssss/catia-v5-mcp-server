@@ -203,7 +203,7 @@ function Invoke-Install {
     $spec = Get-PackageSpec
     Write-Step "Installing $spec (Python $Python)"
     Invoke-Native -Exe $uv -What 'uv tool install' -Arguments @(
-        'tool', 'install', '--force', '--python', $Python,
+        'tool', 'install', '--force', '--compile-bytecode', '--python', $Python,
         '--reinstall-package', $PackageName, '--refresh-package', $PackageName,
         $spec
     )

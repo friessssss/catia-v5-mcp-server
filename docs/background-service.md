@@ -59,7 +59,7 @@ Where things land (all per user):
 | What | Where |
 |------|-------|
 | `catia-mcp.exe`, `catia-mcpw.exe` | `%USERPROFILE%\.local\bin` |
-| The tool's Python (`sys.executable`) | `<uv tool dir>\catia-v5-mcp-server\Scripts\python.exe` (usually `%APPDATA%\uv\data\tools\...`; `uv tool dir` prints it) |
+| The tool's Python (`sys.executable`) | `<uv tool dir>\catia-v5-mcp-server\Scripts\python.exe` (usually `%APPDATA%\uv\tools\...`; `uv tool dir` prints it) |
 | Logs, PID file, captures, API-doc cache | `%LOCALAPPDATA%\catia-mcp` (override: `CATIA_MCP_HOME`) |
 | Autostart | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, value `CATIA MCP Server` |
 
