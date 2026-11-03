@@ -246,3 +246,70 @@ def test_status_answers_while_catia_is_not_running(monkeypatch):
             await server.close()
 
     run(body())
+
+
+def test_proxy_writes_utf8_bytes_even_on_an_ansi_console(monkeypatch):
+    import io
+
+    from catia_mcp.proxy import Proxy
+
+    raw = io.BytesIO()
+    # A Windows pipe: cp1252 text layer over a byte buffer.
+    monkeypatch.setattr("sys.stdout", io.TextIOWrapper(raw, encoding="cp1252"))
+
+    async def body():
+        proxy = Proxy(8765)
+        await proxy._write({"jsonrpc": "2.0", "id": 1, "result": {"d": "surface ∩ plane, 90°"}})
+        await proxy._client.aclose()
+
+    run(body())
+    assert raw.getvalue().decode("utf-8").strip().endswith('"surface ∩ plane, 90°"}}')
+
+
+def test_proxy_answers_even_when_relaying_fails(monkeypatch):
+    import io
+    import json
+
+    from catia_mcp.proxy import Proxy
+
+    raw = io.BytesIO()
+    monkeypatch.setattr("sys.stdout", io.TextIOWrapper(raw, encoding="utf-8"))
+
+    async def body():
+        proxy = Proxy(8765)
+
+        async def broken(message, text):
+            raise RuntimeError("boom")
+
+        proxy._relay = broken
+        await proxy.handle('{"jsonrpc":"2.0","id":7,"method":"tools/list"}')
+        await proxy._client.aclose()
+
+    run(body())
+    reply = json.loads(raw.getvalue().decode("utf-8"))
+    assert reply["id"] == 7 and "boom" in reply["error"]["message"]
+
+
+def test_stop_never_kills_a_stale_pid(monkeypatch, tmp_path):
+    from catia_mcp import service
+
+    monkeypatch.setenv("CATIA_MCP_HOME", str(tmp_path))
+    service.pid_file().write_text('{"pid": 4242, "port": 8765}', encoding="utf-8")
+    monkeypatch.setattr(service, "health", lambda *a, **k: None)
+    killed = []
+    monkeypatch.setattr(service.subprocess, "run", lambda *a, **k: killed.append(a))
+    monkeypatch.setattr(service.os, "kill", lambda *a: killed.append(a))
+    assert "not running" in service.stop(8765)
+    assert killed == [] and not service.pid_file().exists()
+
+
+def test_desktop_config_with_bom_is_updated(tmp_path):
+    import json
+
+    from catia_mcp import service
+
+    path = tmp_path / "claude_desktop_config.json"
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"mcpServers": {"other": {"command": "x"}}}).encode())
+    service.update_desktop_config(path, {"command": "py", "args": ["-m", "catia_mcp", "proxy"]})
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert set(data["mcpServers"]) == {"other", "catia"}

@@ -46,13 +46,19 @@ class Proxy:
         if token:
             self.headers["Authorization"] = f"Bearer {token}"
         self._write_lock = asyncio.Lock()
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=5.0))
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(None, connect=5.0),
+            # 127.0.0.1 must never go through a corporate HTTP proxy.
+            trust_env=False,
+        )
 
     async def _write(self, payload: Any) -> None:
-        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        # Bytes, always UTF-8: on Windows a piped sys.stdout uses the ANSI
+        # code page, which cannot encode e.g. the "∩" in a tool description.
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
         async with self._write_lock:
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
 
     async def _post(self, body: bytes) -> httpx.Response:
         try:
@@ -68,6 +74,15 @@ class Proxy:
         except ValueError:
             logger.warning("Dropping non-JSON line from client: %r", raw[:200])
             return
+        try:
+            await self._relay(message, raw)
+        except Exception as error:
+            logger.exception("Proxy failed on %s", message.get("method"))
+            reply = _error_reply(message, f"CATIA MCP proxy error: {error}")
+            if reply:
+                await self._write(reply)
+
+    async def _relay(self, message: dict[str, Any], raw: str) -> None:
         try:
             response = await self._post(raw.encode("utf-8"))
         except Exception as error:  # noqa: BLE001 -- reported to the client

@@ -391,6 +391,11 @@ class DocumentTools:
             with file_alerts_off(self.conn.app):
                 doc.SaveAs(file_path)
             with after_mutation():
+                # CATIA may append the document's extension to a bare path;
+                # check the file it reports having written.
+                written = str(safe_get(doc, "FullName", "") or file_path)
+                if _mtime(written) is not None and _mtime(file_path) is None:
+                    file_path = written
                 after_mtime = _mtime(file_path)
                 if after_mtime is None:
                     raise ObjectNotFound(

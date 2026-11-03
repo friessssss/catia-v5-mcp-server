@@ -50,7 +50,11 @@ def health(port: int = DEFAULT_PORT, timeout: float = 2.0, token: str | None = N
     """The running service's /health payload, or None if nothing answers."""
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     try:
-        response = httpx.get(base_url(port) + HEALTH_PATH, timeout=timeout, headers=headers)
+        # trust_env=False: a corporate proxy from the registry or HTTP_PROXY
+        # would otherwise receive this loopback request.
+        response = httpx.get(
+            base_url(port) + HEALTH_PATH, timeout=timeout, headers=headers, trust_env=False
+        )
     except httpx.HTTPError:
         return None
     if response.status_code != 200:
@@ -136,6 +140,9 @@ def start_detached(port: int = DEFAULT_PORT) -> subprocess.Popen:
         stderr=subprocess.DEVNULL,
         creationflags=flags,
         close_fds=True,
+        # Not the caller's directory: `-m` puts the working directory first on
+        # sys.path, where a checkout or stray .py file would shadow modules.
+        cwd=str(state_dir()),
         start_new_session=os.name != "nt",
     )
 
@@ -159,13 +166,17 @@ def ensure_running(port: int = DEFAULT_PORT, wait: float = 20.0) -> dict:
 
 
 def stop(port: int = DEFAULT_PORT) -> str:
+    """Stop the service on `port`. Only the PID the live service reports in
+    /health is killed: a PID file left by a crash or a logoff may name an
+    unrelated process by now (CATIA itself, with unsaved work)."""
+    live = health(port)
     try:
-        data = json.loads(pid_file().read_text(encoding="utf-8"))
-        pid = int(data["pid"])
-    except (OSError, ValueError, KeyError):
-        return "No service PID file; nothing to stop." if health(port) is None else (
-            f"A server answers on port {port} but left no PID file; stop it from Task Manager."
-        )
+        pid_file().unlink()
+    except OSError:
+        pass
+    if live is None:
+        return "The CATIA MCP service is not running."
+    pid = int(live["pid"])
     if os.name == "nt":
         subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False
@@ -181,10 +192,6 @@ def stop(port: int = DEFAULT_PORT) -> str:
         if health(port, timeout=0.5) is None:
             break
         time.sleep(0.25)
-    try:
-        pid_file().unlink()
-    except OSError:
-        pass
     return f"Stopped the CATIA MCP service (PID {pid})."
 
 
@@ -261,7 +268,7 @@ def update_desktop_config(path: Path, entry: dict[str, Any] | None) -> str:
     config, keeping everything else and a .bak copy of the original."""
     data: dict[str, Any] = {}
     if path.exists():
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")  # PowerShell 5.1 writes a BOM
         if text.strip():
             try:
                 data = json.loads(text)

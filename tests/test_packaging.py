@@ -285,7 +285,8 @@ def test_service_health_ignores_a_foreign_server():
 
 
 def test_proxy_relays_initialize_and_tools_list(monkeypatch):
-    out = io.StringIO()
+    raw = io.BytesIO()
+    out = io.TextIOWrapper(raw, encoding="utf-8")
     monkeypatch.setattr(sys, "stdout", out)
 
     async def body(port, _):
@@ -313,7 +314,7 @@ def test_proxy_relays_initialize_and_tools_list(monkeypatch):
             await proxy._client.aclose()
 
     asyncio.run(_with_http_server(body))
-    replies = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+    replies = [json.loads(line) for line in raw.getvalue().decode("utf-8").splitlines() if line.strip()]
     assert [r["id"] for r in replies] == [1, 2]
     init, listing = replies
     assert init["result"]["serverInfo"]["name"] == "catia-mcp"
@@ -323,7 +324,8 @@ def test_proxy_relays_initialize_and_tools_list(monkeypatch):
 
 
 def test_proxy_reports_unreachable_service_as_jsonrpc_error(monkeypatch):
-    out = io.StringIO()
+    raw = io.BytesIO()
+    out = io.TextIOWrapper(raw, encoding="utf-8")
     monkeypatch.setattr(sys, "stdout", out)
 
     def no_service(port, wait=20.0):
@@ -340,7 +342,7 @@ def test_proxy_reports_unreachable_service_as_jsonrpc_error(monkeypatch):
             await proxy._client.aclose()
 
     asyncio.run(body())
-    replies = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+    replies = [json.loads(line) for line in raw.getvalue().decode("utf-8").splitlines() if line.strip()]
     assert len(replies) == 1
     assert replies[0]["id"] == 7
     assert "unreachable" in replies[0]["error"]["message"]

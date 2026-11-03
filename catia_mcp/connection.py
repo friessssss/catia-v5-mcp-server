@@ -91,6 +91,8 @@ class CATIAConnection:
         # Incremented on every attach and drop; cached proxies from an older
         # generation belong to a CATIA process that may no longer exist.
         self.generation = 0
+        # Window caption read on attach, for /health (which must not call COM).
+        self.caption: str | None = None
         self._forced_platform = normalize_platform(
             platform if platform is not None else os.environ.get("CATIA_MCP_PLATFORM")
         )
@@ -162,6 +164,7 @@ class CATIAConnection:
             self._active_bodies.clear()
             self.platform = self._detect_platform()
             version = self._get_version()
+            self.caption = version
             logger.info("Connected to running %s instance (%s)", self.platform_label, version)
             return f"Connected to running {self.platform_label} instance ({version})"
         except Exception as error:
@@ -184,6 +187,7 @@ class CATIAConnection:
             self.app.Visible = True
             self.platform = self._detect_platform()
             version = self._get_version()
+            self.caption = version
             logger.info("Launched new %s instance (%s)", self.platform_label, version)
             note = ""
             if self.is_3dx:

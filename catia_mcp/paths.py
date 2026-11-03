@@ -32,16 +32,16 @@ def state_dir() -> Path:
     return base
 
 
-def log_path() -> Path:
-    return state_dir() / "catia_mcp.log"
+def log_path(name: str = "catia_mcp.log") -> Path:
+    return state_dir() / name
 
 
-def configure_logging(console: bool = True) -> Path:
+def configure_logging(console: bool = True, filename: str = "catia_mcp.log") -> Path:
     """Log to a rotating file in the state directory, plus stderr when one
     exists. Under pythonw.exe stdout/stderr are None; they are pointed at a
     separate stdio.log (never the rotated log: Windows cannot rename a file
     another handle keeps open) so stray prints cannot crash the process."""
-    path = log_path()
+    path = log_path(filename)
     if sys.stderr is None or sys.stdout is None:
         stdio = state_dir() / "stdio.log"
         stream = open(stdio, "w", encoding="utf-8", buffering=1)  # noqa: SIM115 -- process lifetime

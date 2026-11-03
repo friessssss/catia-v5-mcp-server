@@ -145,7 +145,7 @@ function Stop-ToolProcesses {
     # the `catia-mcp proxy` that Claude Desktop keeps open).
     try {
         $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
-            $_.ExecutablePath -and $_.ExecutablePath -like "*\uv\tools\$PackageName\*"
+            $_.ExecutablePath -and $_.ExecutablePath -like "*\tools\$PackageName\*"
         })
     } catch {
         return

@@ -9,7 +9,6 @@ def catia_dialog_titles() -> list[str]:
     """Titles of visible dialog windows (#32770 or owned popups) belonging to
     a CATIA process. Empty off Windows or when nothing is found."""
     try:
-        import win32api
         import win32con
         import win32gui
         import win32process
@@ -19,16 +18,28 @@ def catia_dialog_titles() -> list[str]:
     exe_by_pid: dict[int, str] = {}
 
     def exe_name(pid: int) -> str:
+        # QueryFullProcessImageNameW works with the limited-information
+        # right (GetModuleFileNameEx would also need PROCESS_VM_READ).
         if pid not in exe_by_pid:
             name = ""
             try:
-                handle = win32api.OpenProcess(
+                import ctypes
+                from ctypes import wintypes
+
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.OpenProcess(
                     win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid
                 )
-                try:
-                    name = win32process.GetModuleFileNameEx(handle, 0).rsplit("\\", 1)[-1]
-                finally:
-                    win32api.CloseHandle(handle)
+                if handle:
+                    try:
+                        size = wintypes.DWORD(1024)
+                        buffer = ctypes.create_unicode_buffer(size.value)
+                        if kernel32.QueryFullProcessImageNameW(
+                            handle, 0, buffer, ctypes.byref(size)
+                        ):
+                            name = buffer.value.rsplit("\\", 1)[-1]
+                    finally:
+                        kernel32.CloseHandle(handle)
             except Exception:  # noqa: BLE001 -- protected/exited process: not CATIA's
                 name = ""
             exe_by_pid[pid] = name.lower()

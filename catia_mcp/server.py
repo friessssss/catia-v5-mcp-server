@@ -108,6 +108,18 @@ _NO_AUTO_CONNECT = frozenset(
     {"catia_connect", "catia_disconnect", "catia_status", "catia_api_search", "catia_api_doc"}
 )
 
+_DOCUMENT_SWITCH = frozenset(
+    {
+        "catia_new_part",
+        "catia_new_product",
+        "catia_new_drawing",
+        "catia_open_document",
+        "catia_open_from_database",
+        "catia_close_document",
+        "catia_activate_document",
+    }
+)
+
 _PY_ATTRIBUTE_ERROR = re.compile(
     r"^'(NoneType|str|int|float|bool|list|dict|tuple|bytes)' object has no attribute"
 )
@@ -313,12 +325,14 @@ class CATIAMCPServer:
         }
 
     def _record_connection(self) -> None:
+        """Plain attribute reads only: a COM call here could block the
+        worker after the busy marker is cleared."""
         conn = self.connection
         connected = conn.app is not None
         self._catia_state = {
             "connected": connected,
             "platform": conn.platform_label if connected else None,
-            "caption": conn._get_version() if connected else None,
+            "caption": conn.caption if connected else None,
         }
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
@@ -371,11 +385,11 @@ class CATIAMCPServer:
         try:
             return self._run_tool(name, arguments)
         finally:
-            self._busy = None
             try:
                 self._record_connection()
             except Exception:  # noqa: BLE001 -- status only
                 pass
+            self._busy = None
 
     def _run_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
         module = self._tool_router.get(name)
@@ -391,6 +405,10 @@ class CATIAMCPServer:
             if name not in _NO_AUTO_CONNECT:
                 self.connection.ensure_connected()
             self._reset_stale_modules()
+            if name in _DOCUMENT_SWITCH:
+                # A sketch left open in the previous document must not be
+                # closed or used as a profile in the next one.
+                self.sketcher_tools.reset_session_state()
             stage = "connect" if name == "catia_connect" else "execute"
             result = module.execute(name, arguments)
             if isinstance(result, CallToolResult):
@@ -611,7 +629,9 @@ def main(argv: list[str] | None = None) -> None:
     if command == "proxy":
         from catia_mcp.proxy import run_proxy
 
-        configure_logging(console=True)
+        # Its own file: a second process holding catia_mcp.log open would make
+        # the service's log rotation fail on Windows.
+        configure_logging(console=True, filename="proxy.log")
         run_proxy(args.port, args.token)
         return
     if command == "serve":
