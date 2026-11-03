@@ -246,12 +246,23 @@ def extraction_dir(chm: Path) -> Path:
     return docs_root() / f"{chm.stem}-{chm.stat().st_size}"
 
 
+def _short_path(path: Path) -> str:
+    """8.3 form of a path on Windows (hh.exe mishandles quoted paths with
+    spaces); the path unchanged elsewhere or when 8.3 names are off."""
+    try:
+        import win32api
+
+        return str(win32api.GetShortPathName(str(path)))
+    except Exception:  # noqa: BLE001 -- not Windows / no 8.3 names
+        return str(path)
+
+
 def _extract_commands(chm: Path, dest: Path) -> list[list[str]]:
     commands: list[list[str]] = []
     windir = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
     hh = shutil.which("hh.exe") or (str(Path(windir) / "hh.exe") if windir else None)
     if hh:
-        commands.append([hh, "-decompile", str(dest), str(chm)])
+        commands.append([hh, "-decompile", _short_path(dest), _short_path(chm)])
     seven = shutil.which("7z") or shutil.which("7z.exe")
     if seven:
         commands.append([seven, "x", "-y", f"-o{dest}", str(chm)])
@@ -262,23 +273,30 @@ def _has_html(directory: Path) -> bool:
     return any(p.suffix.lower() in _HTML_SUFFIXES for p in directory.rglob("*"))
 
 
-def extract_chm(
-    chm: Path,
-    dest: Path,
-    runner: Callable[..., Any] = subprocess.run,
-) -> Path:
-    """Decompile `chm` into `dest` once. hh.exe's exit code is unreliable,
-    so success is judged by HTML files appearing in dest."""
-    if (dest / _DONE_MARKER).exists():
-        return dest
-    dest.mkdir(parents=True, exist_ok=True)
+_CHM_REF = re.compile(r"([A-Za-z0-9_.\-]+\.chm)", re.IGNORECASE)
+
+
+def _merged_chms(dest: Path, chm: Path) -> list[Path]:
+    """CHMs a master help file merges in ([MERGE FILES] in the .hhp,
+    ms-its:X.chm:: links in the contents): Dassault splits large references
+    that way, and the master alone then holds no pages."""
+    names: set[str] = set()
+    for item in dest.rglob("*"):
+        if item.suffix.lower() in {".hhp", ".hhc", ".hhk"} and item.is_file():
+            try:
+                names.update(_CHM_REF.findall(item.read_text(encoding="latin-1")))
+            except OSError:
+                continue
+    found = []
+    for name in sorted(names):
+        candidate = chm.parent / Path(name).name
+        if candidate.is_file() and candidate.resolve() != chm.resolve():
+            found.append(candidate)
+    return found
+
+
+def _run_extractors(chm: Path, dest: Path, runner: Callable[..., Any], errors: list[str]) -> bool:
     commands = _extract_commands(chm, dest)
-    if not commands:
-        raise UnsupportedCapability(
-            "Cannot decompile the CATIA automation CHM: neither hh.exe (Windows) nor "
-            "7-Zip was found. Set CATIA_MCP_API_CHM or use catia_inspect_api instead."
-        )
-    errors: list[str] = []
     for command in commands:
         try:
             runner(command, check=False, timeout=600, capture_output=True)
@@ -286,9 +304,35 @@ def extract_chm(
             errors.append(f"{Path(command[0]).name}: {e}")
             continue
         if _has_html(dest):
-            (dest / _DONE_MARKER).write_text(str(chm), encoding="utf-8")
-            return dest
-        errors.append(f"{Path(command[0]).name}: no HTML pages produced")
+            return True
+        errors.append(f"{Path(command[0]).name} on {chm.name}: no HTML pages produced")
+    return False
+
+
+def extract_chm(
+    chm: Path,
+    dest: Path,
+    runner: Callable[..., Any] = subprocess.run,
+) -> Path:
+    """Decompile `chm` into `dest` once. hh.exe's exit code is unreliable,
+    so success is judged by HTML files appearing in dest. A master CHM
+    without pages of its own pulls in the CHMs it merges."""
+    if (dest / _DONE_MARKER).exists():
+        return dest
+    dest.mkdir(parents=True, exist_ok=True)
+    if not _extract_commands(chm, dest):
+        raise UnsupportedCapability(
+            "Cannot decompile the CATIA automation CHM: neither hh.exe (Windows) nor "
+            "7-Zip was found. Set CATIA_MCP_API_CHM or use catia_inspect_api instead."
+        )
+    errors: list[str] = []
+    ok = _run_extractors(chm, dest, runner, errors)
+    if not ok:
+        for merged in _merged_chms(dest, chm):
+            ok = _run_extractors(merged, dest / merged.stem, runner, errors) or ok
+    if ok:
+        (dest / _DONE_MARKER).write_text(str(chm), encoding="utf-8")
+        return dest
     raise UnsupportedCapability(
         f"Could not decompile {chm} ({'; '.join(errors)}). "
         "Use catia_inspect_api to read the live type information instead."
@@ -316,37 +360,82 @@ def cached_extractions() -> list[Path]:
 
 
 class ApiDocs:
-    """Lazily locates, extracts and indexes one installation's CHM."""
+    """Lazily locates, extracts and indexes one installation's CHM; falls
+    back to an index of CATIA's type libraries (exact member signatures and
+    helpstrings, no prose) when the CHM is missing or cannot be unpacked."""
 
     def __init__(self, runner: Callable[..., Any] = subprocess.run) -> None:
         self.runner = runner
         self.html_dir: Path | None = None
         self.index: list[dict[str, str]] | None = None
         self.source: str | None = None
+        self.note: str | None = None
 
-    def ensure(self, app_full_name: str | None) -> tuple[Path, list[dict[str, str]]]:
-        if self.html_dir is not None and self.index is not None:
+    def ensure(
+        self,
+        app_full_name: str | None,
+        typelibs: Callable[[], list[Any]] | None = None,
+    ) -> tuple[Path | None, list[dict[str, str]]]:
+        if self.index is not None:
             return self.html_dir, self.index
-        chm = find_chm(app_full_name)
-        if chm is not None:
-            html_dir = extract_chm(chm, extraction_dir(chm), self.runner)
-            self.source = str(chm)
-        else:
-            cached = cached_extractions()
-            if not cached:
-                where = (
-                    f"near {Path(app_full_name).parent}" if app_full_name
-                    else "(CATIA is not connected, so its install folder is unknown)"
-                )
+        try:
+            html_dir = self._chm_dir(app_full_name)
+        except UnsupportedCapability as error:
+            if typelibs is None:
+                raise
+            from catia_mcp.introspect import typelib_index
+
+            libs = typelibs()
+            index = typelib_index(libs)
+            if not index:
                 raise UnsupportedCapability(
-                    f"No CATIA automation reference (*Automation*.chm) found {where}. "
-                    "Set CATIA_MCP_API_CHM to the CHM path, or use catia_inspect_api."
-                )
-            html_dir = cached[0]
-            self.source = f"cached extraction {html_dir.name}"
+                    f"{error} No CATIA type library could be read either."
+                ) from error
+            self.html_dir = None
+            self.index = index
+            self.source = f"CATIA type libraries ({len(libs)} loaded)"
+            self.note = f"Help file unavailable, searching type libraries instead: {error}"
+            return None, index
         self.html_dir = html_dir
         self.index = load_index(html_dir)
         return html_dir, self.index
 
+    def _chm_dir(self, app_full_name: str | None) -> Path:
+        chm = find_chm(app_full_name)
+        if chm is not None:
+            html_dir = extract_chm(chm, extraction_dir(chm), self.runner)
+            self.source = str(chm)
+            return html_dir
+        cached = cached_extractions()
+        if not cached:
+            where = (
+                f"near {Path(app_full_name).parent}" if app_full_name
+                else "(CATIA is not connected, so its install folder is unknown)"
+            )
+            raise UnsupportedCapability(
+                f"No CATIA automation reference (*Automation*.chm) found {where}. "
+                "Set CATIA_MCP_API_CHM to the CHM path, or use catia_inspect_api."
+            )
+        self.source = f"cached extraction {cached[0].name}"
+        return cached[0]
+
+    def chunk(self, page: str, offset: int = 0) -> tuple[str, str, str, int, int | None]:
+        """(resolved page, title, text from offset, total, next offset)."""
+        assert self.index is not None
+        resolved = resolve_page(self.index, page)
+        entry = next(e for e in self.index if e["page"] == resolved)
+        if self.html_dir is not None:
+            text, total, next_offset = page_chunk(self.html_dir, resolved, offset)
+        else:
+            if offset < 0:
+                raise InvalidArgument("offset must not be negative.")
+            full = entry["text"]
+            end = offset + PAGE_TEXT_CHARS
+            text, total, next_offset = full[offset:end], len(full), (end if end < len(full) else None)
+        return resolved, entry["title"], text, total, next_offset
+
     def describe(self) -> dict[str, Any]:
-        return {"source": self.source, "pages": len(self.index or [])}
+        info: dict[str, Any] = {"source": self.source, "pages": len(self.index or [])}
+        if self.note:
+            info["note"] = self.note
+        return info

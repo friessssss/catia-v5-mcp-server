@@ -584,3 +584,115 @@ def test_long_interface_page_is_searchable_and_chunked(tmp_path):
         text, total, next_offset = apidocs.page_chunk(html_dir, "HybridShapeFactory.htm", next_offset)
         chunks.append(text)
     assert len("".join(chunks)) == total and "AddNewOffset" in chunks[-1]
+
+
+# ── API docs fallbacks (live R428: hh.exe produced no pages) ──
+
+
+class _FakeFuncDesc:
+    def __init__(self, memid, invkind, args):
+        self.memid = memid
+        self.invkind = invkind
+        self.args = args
+        self.wFuncFlags = 0
+
+
+class _FakeVarDesc:
+    def __init__(self, memid, value):
+        self.memid = memid
+        self.value = value
+
+
+class _FakeTypeInfo:
+    """ITypeInfo of one interface (AddNewPad) or one enum."""
+
+    def __init__(self, kind):
+        self.kind = kind
+
+    def GetTypeAttr(self):  # noqa: N802
+        attr = [0] * 15
+        attr[5] = self.kind
+        attr[6] = 1 if self.kind == 4 else 0  # cFuncs
+        attr[7] = 2 if self.kind == 0 else 0  # cVars
+        return attr
+
+    def GetFuncDesc(self, j):  # noqa: N802
+        return _FakeFuncDesc(7, 1, [(9, 1), (5, 1)])
+
+    def GetVarDesc(self, j):  # noqa: N802
+        return _FakeVarDesc(100 + j, j)
+
+    def GetNames(self, memid):  # noqa: N802
+        if memid == 7:
+            return ["AddNewPad", "iSketch", "iHeight"]
+        return [f"catValue{memid - 100}"]
+
+    def GetDocumentation(self, memid):  # noqa: N802
+        return ("x", "Creates a new pad." if memid == 7 else "", 0, None)
+
+    def GetRefTypeInfo(self, ref):  # noqa: N802
+        raise RuntimeError
+
+
+class _FakeTypeLib:
+    def GetDocumentation(self, i):  # noqa: N802
+        return {-1: ("PartTypeLib", ""), 0: ("ShapeFactory", "Part design features"),
+                1: ("CatLimitMode", "")}[i]
+
+    def GetTypeInfoCount(self):  # noqa: N802
+        return 2
+
+    def GetTypeInfoType(self, i):  # noqa: N802
+        return 4 if i == 0 else 0
+
+    def GetTypeInfo(self, i):  # noqa: N802
+        return _FakeTypeInfo(4 if i == 0 else 0)
+
+
+def test_typelib_index_lists_signatures_helpstrings_and_enums():
+    from catia_mcp.introspect import typelib_index
+
+    index = typelib_index([_FakeTypeLib()])
+    by_title = {e["title"]: e for e in index}
+    pad = by_title["ShapeFactory"]["text"]
+    assert "AddNewPad(iSketch: object, iHeight: double) - Creates a new pad." in pad
+    assert "interface in PartTypeLib" in pad
+    assert "catValue1 = 1" in by_title["CatLimitMode"]["text"]
+
+
+def test_api_docs_fall_back_to_type_libraries_when_the_chm_will_not_unpack(tmp_path, monkeypatch):
+    monkeypatch.setenv("CATIA_MCP_HOME", str(tmp_path / "home"))
+    chm = tmp_path / "DSYAutomation.chm"
+    chm.write_bytes(b"ITSF")
+    monkeypatch.setenv("CATIA_MCP_API_CHM", str(chm))
+    monkeypatch.setattr(apidocs, "_extract_commands", lambda c, d: [["hh.exe", "-decompile", str(d), str(c)]])
+
+    docs = apidocs.ApiDocs(runner=lambda *a, **k: None)  # hh.exe "succeeds" but writes nothing
+    html_dir, index = docs.ensure(None, lambda: [_FakeTypeLib()])
+    assert html_dir is None
+    assert apidocs.search(index, "AddNewPad")[0]["title"] == "ShapeFactory"
+    assert docs.describe()["source"].startswith("CATIA type libraries")
+    assert "no HTML pages" in docs.describe()["note"]
+    page, title, text, total, _ = docs.chunk("ShapeFactory")
+    assert title == "ShapeFactory" and "AddNewPad" in text and total == len(text)
+
+
+def test_master_chm_pulls_in_the_chms_it_merges(tmp_path, monkeypatch):
+    monkeypatch.setenv("CATIA_MCP_HOME", str(tmp_path / "home"))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    master = bin_dir / "DSYAutomation.chm"
+    master.write_bytes(b"ITSF")
+    (bin_dir / "PartAutomation.chm").write_bytes(b"ITSF")
+    monkeypatch.setattr(apidocs, "_extract_commands", lambda c, d: [["hh.exe", "-decompile", str(d), str(c)]])
+
+    def fake_hh(command, **kwargs):
+        dest, chm = Path(command[2]), Path(command[3])
+        dest.mkdir(parents=True, exist_ok=True)
+        if chm.name == "DSYAutomation.chm":
+            (dest / "master.hhp").write_text("[MERGE FILES]\nPartAutomation.chm\n")
+        else:
+            (dest / "ShapeFactory.htm").write_text("<title>ShapeFactory</title>AddNewPad")
+
+    out = apidocs.extract_chm(master, tmp_path / "out", fake_hh)
+    assert (out / "PartAutomation" / "ShapeFactory.htm").exists()

@@ -109,7 +109,18 @@ def _param_flags(fd: Any) -> list[int]:
 
 def describe_members(obj: Any) -> list[dict[str, Any]]:
     """List methods and properties with parameter names and directions."""
-    ti = type_info(obj)
+    return describe_typeinfo(type_info(obj))
+
+
+def _member_doc(ti: Any, memid: Any) -> str:
+    try:
+        return str(ti.GetDocumentation(memid)[1] or "").strip()
+    except Exception:
+        return ""
+
+
+def describe_typeinfo(ti: Any, with_docs: bool = False) -> list[dict[str, Any]]:
+    """describe_members for an ITypeInfo (with_docs adds helpstrings)."""
     attr = ti.GetTypeAttr()
     methods: dict[str, dict[str, Any]] = {}
     properties: dict[str, dict[str, Any]] = {}
@@ -144,10 +155,14 @@ def describe_members(obj: Any) -> list[dict[str, Any]]:
                     "optional": bool(flag & PARAMFLAG_FOPT),
                 })
             methods[name] = {"name": name, "kind": "method", "params": params}
+            if with_docs and (doc := _member_doc(ti, fd.memid)):
+                methods[name]["doc"] = doc
         else:
             entry = properties.setdefault(
                 name, {"name": name, "kind": "property", "readable": False, "writable": False}
             )
+            if with_docs and "doc" not in entry and (doc := _member_doc(ti, fd.memid)):
+                entry["doc"] = doc
             if invkind == INVOKE_PROPERTYGET:
                 entry["readable"] = True
                 indexed = [f for f in flags if not f & PARAMFLAG_FRETVAL]
@@ -171,6 +186,66 @@ def method_params(obj: Any, method: str) -> list[dict[str, Any]] | None:
         if member["kind"] == "method" and member["name"].lower() == method.lower():
             return member["params"]
     return None
+
+
+def _render_member(member: dict[str, Any]) -> str:
+    if member["kind"] == "method":
+        params = ", ".join(
+            f"{'out ' if p['out'] else ''}{p['name']}: {p['type']}{'?' if p['optional'] else ''}"
+            for p in member["params"]
+        )
+        line = f"  {member['name']}({params})"
+    else:
+        access = "/".join(a for a, on in (("get", member["readable"]), ("set", member["writable"])) if on)
+        line = f"  {member['name']} [{access or 'property'}]"
+    doc = member.get("doc")
+    return f"{line} - {doc}" if doc else line
+
+
+def typelib_index(libs: list[Any]) -> list[dict[str, str]]:
+    """Searchable API reference built from type libraries: one entry per
+    interface (members with signatures and helpstrings) and per enum. The
+    same shape as an indexed CHM page: {page, title, text}."""
+    entries: dict[str, dict[str, str]] = {}
+    for lib in libs:
+        try:
+            lib_name = str(lib.GetDocumentation(-1)[0])
+            count = int(lib.GetTypeInfoCount())
+        except Exception:
+            continue
+        for i in range(count):
+            try:
+                kind = int(lib.GetTypeInfoType(i))
+                name, doc = (str(v or "") for v in lib.GetDocumentation(i)[:2])
+            except Exception:
+                continue
+            if not name or name in entries:
+                continue
+            try:
+                ti = lib.GetTypeInfo(i)
+                if kind in (TKIND_DISPATCH, TKIND_INTERFACE):
+                    members = describe_typeinfo(ti, with_docs=True)
+                    body = "\n".join(_render_member(m) for m in members)
+                    label = "interface"
+                elif kind == TKIND_ENUM:
+                    attr = ti.GetTypeAttr()
+                    values = []
+                    for j in range(int(attr[7])):  # cVars
+                        vd = ti.GetVarDesc(j)
+                        values.append(f"  {ti.GetNames(vd.memid)[0]} = {int(vd.value)}")
+                    body = "\n".join(values)
+                    label = "enum"
+                else:
+                    continue
+            except Exception:
+                continue
+            header = f"{name} ({label} in {lib_name})" + (f": {doc.strip()}" if doc.strip() else "")
+            entries[name] = {
+                "page": f"{lib_name}/{name}",
+                "title": name,
+                "text": f"{header}\n{body}",
+            }
+    return list(entries.values())
 
 
 def _type_libraries(objs: list[Any]) -> list[Any]:

@@ -16,7 +16,7 @@ model changed.
 from __future__ import annotations
 
 from collections.abc import Callable
-from pathlib import PurePath
+from pathlib import Path, PurePath
 from typing import Any
 
 from catia_mcp import apidocs
@@ -412,8 +412,53 @@ class SessionTools:
             return None
         return _text(_try(lambda: self.conn.app.FullName))
 
+    def _type_libraries(self) -> list[Any]:
+        """Type libraries of this CATIA: the .tlb files beside the executable
+        (every framework) plus those of the reachable live objects."""
+        from catia_mcp.introspect import _type_libraries
+
+        libs: list[Any] = []
+        names: set[str] = set()
+
+        def add(lib: Any) -> None:
+            try:
+                name = str(lib.GetDocumentation(-1)[0])
+            except Exception:  # noqa: BLE001
+                return
+            if name not in names:
+                names.add(name)
+                libs.append(lib)
+
+        full_name = _text(_try(lambda: self.conn.app.FullName))
+        try:
+            import pythoncom
+        except ImportError:
+            pythoncom = None  # not Windows: live objects only
+        if full_name and pythoncom is not None:
+            for tlb in sorted(Path(full_name).parent.glob("*.tlb")):
+                try:
+                    add(pythoncom.LoadTypeLib(str(tlb)))
+                except Exception:  # noqa: BLE001 -- not every .tlb loads
+                    continue
+        objects: list[Any] = [self.conn.app]
+        for getter in (
+            lambda: self.conn.active_document,
+            lambda: self.conn.get_active_part(),
+            lambda: self.conn.get_active_part().ShapeFactory,
+            lambda: self.conn.get_active_part().HybridShapeFactory,
+        ):
+            obj = _try(getter)
+            if obj is not None:
+                objects.append(obj)
+        for lib in _type_libraries(objects):
+            add(lib)
+        return libs
+
+    def _ensure_docs(self) -> tuple[Any, list[dict[str, str]]]:
+        return self.docs.ensure(self._app_full_name(), self._type_libraries)
+
     def _api_search(self, query: str, max_results: int) -> dict[str, Any]:
-        _, index = self.docs.ensure(self._app_full_name())
+        _, index = self._ensure_docs()
         results = apidocs.search(index, query, max_results)
         return operation_result(
             tool="catia_api_search",
@@ -425,10 +470,8 @@ class SessionTools:
         )
 
     def _api_doc(self, page: str, offset: int = 0) -> dict[str, Any]:
-        html_dir, index = self.docs.ensure(self._app_full_name())
-        resolved = apidocs.resolve_page(index, page)
-        title = next((e["title"] for e in index if e["page"] == resolved), resolved)
-        text, total, next_offset = apidocs.page_chunk(html_dir, resolved, offset)
+        self._ensure_docs()
+        resolved, title, text, total, next_offset = self.docs.chunk(page, offset)
         message = f"API reference page '{title}'."
         if next_offset is not None:
             message += f" More text follows: call again with offset={next_offset}."
