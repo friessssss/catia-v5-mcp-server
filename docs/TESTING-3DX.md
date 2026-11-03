@@ -41,14 +41,14 @@ found, close PowerShell, open a new one and retry.)
 
 ## 3. Automated smoke test (through the service)
 
-Paste these two lines one at a time:
+Paste these two commands one at a time (Enter after each; never on one line):
 
 ```powershell
 irm https://raw.githubusercontent.com/friessssss/catia-v5-mcp-server/claude/background-service-catia-c43f2e/scripts/live_smoke_test.py -OutFile $env:TEMP\live_smoke_test.py
 ```
 
 ```powershell
-& (Join-Path (uv tool dir) 'catia-v5-mcp-server\Scripts\python.exe') $env:TEMP\live_smoke_test.py --url http://127.0.0.1:8765/mcp --drawing --report "$env:USERPROFILE\Desktop\smoke_report.json"
+& "$env:APPDATA\uv\tools\catia-v5-mcp-server\Scripts\python.exe" $env:TEMP\live_smoke_test.py --url http://127.0.0.1:8765/mcp --drawing --report "$env:USERPROFILE\Desktop\smoke_report.json"
 ```
 
 CATIA will build a test block, holes, patterns and a drawing on its own;
