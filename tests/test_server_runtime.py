@@ -15,15 +15,18 @@ from catia_mcp.server import CATIAMCPServer
 
 def test_registered_tools_and_schemas_are_valid():
     server = CATIAMCPServer()
-    assert len(server._tool_router) == 123
+    assert len(server._tool_router) == 130
     assert not any(name.startswith("catia_caa") for name in server._tool_router)
     for schema in server._schemas.values():
         Draft202012Validator.check_schema(schema)
     asyncio.run(server.close())
 
 
-@pytest.mark.parametrize("error", [ValueError("Wrong sketch"), RuntimeError("No active document")])
-def test_ordinary_failure_does_not_block_connect_or_next_tool(monkeypatch, error):
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [(ValueError("Wrong sketch"), "INVALID_ARGUMENT"), (RuntimeError("No active document"), "COM_ERROR")],
+)
+def test_ordinary_failure_does_not_block_connect_or_next_tool(monkeypatch, error, code):
     async def run():
         server = CATIAMCPServer()
         monkeypatch.setattr(server.connection, "ensure_connected", lambda: None)
@@ -39,7 +42,7 @@ def test_ordinary_failure_does_not_block_connect_or_next_tool(monkeypatch, error
         try:
             failure = await server.call_tool("catia_new_part", {})
             assert failure.isError
-            assert failure.structuredContent["code"] == "COM_ERROR"
+            assert failure.structuredContent["code"] == code
             assert failure.structuredContent["message"] == str(error)
             assert not any(
                 "Bridge" in action
@@ -119,7 +122,9 @@ def test_all_calls_com_initialization_and_cleanup_share_one_worker(monkeypatch):
             assert all(result.content[0].text == "original text" for result in results)
         finally:
             await server.close()
-        assert len(threads) == 5  # initialize, 3 executions, uninitialize
+        # initialize + 3 executions; disconnect keeps the worker's apartment
+        # (tool modules may still hold proxies), so there is no uninitialize.
+        assert len(threads) == 4
         assert len(set(threads)) == 1 and threads[0] != threading.get_ident()
 
     asyncio.run(run())

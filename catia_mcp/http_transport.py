@@ -169,7 +169,13 @@ async def serve(
     # /health is polled by clients and `catia-mcp status`; keep it out of the log.
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     config = uvicorn.Config(
-        app, host=host, port=port, log_level="info", lifespan="on", log_config=None
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        lifespan="on",
+        log_config=None,
+        timeout_graceful_shutdown=5,
     )
     await uvicorn.Server(config).serve()
 

@@ -18,6 +18,7 @@ reads the CATMeasurableType enum from the installation's type library.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import sys
@@ -108,8 +109,8 @@ class DiagnosticsTools:
                 "description": (
                     "Diagnose the running CATIA installation (V5 or 3DEXPERIENCE): "
                     "detected platform, exact version, release and service pack, "
-                    "Python/pywin32 environment, and a probe of which automation APIs "
-                    "(Part Design ShapeFactory, GSD HybridShapeFactory, measurement; on "
+                    "Python/pywin32 environment (with the server log path), and a probe "
+                    "of which automation APIs (Part Design ShapeFactory, GSD HybridShapeFactory, measurement; on "
                     "3DEXPERIENCE also PLM session and editor services) are actually "
                     "exposed. Run this first when tools fail with "
                     "UNSUPPORTED_CAPABILITY, and include its output when "
@@ -154,9 +155,24 @@ class DiagnosticsTools:
             "com_binding": type(app).__name__,
         }
         try:
+            # The distribution metadata carries the real release (e.g. "311");
+            # win32com.__build__ is often missing and read as the fallback.
+            info["pywin32_version"] = importlib.metadata.version("pywin32")
+        except Exception:
+            pass
+        try:
+            from catia_mcp import paths
+
+            info["state_dir"] = str(paths.state_dir())
+            info["log_path"] = str(paths.log_path())
+        except Exception as e:
+            info["log_path"] = f"unavailable: {e}"
+        try:
             import win32com
 
-            info["pywin32_build"] = getattr(win32com, "__build__", "unknown")
+            info["pywin32_build"] = getattr(
+                win32com, "__build__", info.get("pywin32_version", "unknown")
+            )
             gen_path = getattr(win32com, "__gen_path__", None)
             if gen_path:
                 info["gen_py_cache"] = gen_path

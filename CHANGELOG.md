@@ -2,7 +2,89 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.3.0] — Unreleased (pending live validation on 3DEXPERIENCE R428)
+
+### Added
+- **Background service, Fusion-MCP style.** `catia-mcp install` registers a
+  per-user service that starts at logon (HKCU Run key, no admin rights;
+  windowless `pythonw -m catia_mcp serve`), starts it now on
+  `http://127.0.0.1:8765/mcp`, adds a `catia` server to Claude Desktop
+  (classic and MSIX configs, through `catia-mcp proxy`, `.bak` kept) and to
+  Claude Code (`claude mcp add --scope user --transport http`). New commands:
+  `serve`, `proxy` (stdio bridge that starts the service when needed),
+  `start`, `stop`, `status`, `uninstall`; `catia-mcpw` is the windowless
+  launcher. `/health` reports version, commit, PID, uptime, calls, the busy
+  call and the CATIA connection without touching COM. One instance per port.
+- `scripts/install.ps1` (and `install.cmd`): one-line installer for a Windows
+  laptop without admin rights: uv, a private Python 3.13,
+  `uv tool install` from GitHub (`-Branch` for test branches), then
+  `catia-mcp install` and `catia-mcp status`; `-Uninstall` removes it all.
+  Guide: docs/background-service.md.
+- Fusion-parity tools: `catia_run_python` (Python against the live COM
+  objects, returns output and a `result`), `catia_screenshot` returns the
+  picture as MCP image content with an optional view preset, `catia_set_view`
+  with Z-up presets including 8 corner isometrics and explicit sight/up
+  vectors, `catia_status`, `catia_get_selection`, `catia_undo` /
+  `catia_redo`, `catia_api_search` / `catia_api_doc` over the installation's
+  own automation reference (CHM). `CATIA_MCP_TOOLSET=core` lists only that
+  core surface.
+- Per-call timeout (`CATIA_MCP_CALL_TIMEOUT`, 600 s) returning
+  `CATIA_TIMEOUT`, and `CATIA_BUSY` fast-fail (`CATIA_MCP_BUSY_GRACE`, 30 s)
+  while CATIA is stuck, both naming open CATIA dialogs.
+- Optional `images` extra (Pillow) for screenshot downscaling and PNG.
+- `scripts/live_smoke_test.py --url` runs the live test through the service
+  over HTTP; new steps for status, image screenshots, selection, Python,
+  API search and undo/redo (`EYES` rows for a human to confirm), and a
+  per-tool PASS/FAIL table.
+
+### Changed
+- The server attaches only to a running CATIA; tools fail with
+  `CATIA_NOT_RUNNING` until it is started, and reattach by themselves after
+  CATIA restarts. `CATIA_MCP_LAUNCH=1` restores launching CATIA V5.
+- Script tools (`catia_run_python`, `catia_run_script`) are on by default
+  for stdio and loopback, off when listening beyond loopback unless
+  `--allow-scripts`; `--no-scripts` / `CATIA_MCP_ALLOW_SCRIPTS=0` disable them.
+- The HTTP transport is stateless with JSON responses, so a service or CATIA
+  restart never strands a client on an expired session.
+- Logs and state moved to `%LOCALAPPDATA%\catia-mcp` (`CATIA_MCP_HOME`
+  overrides), rotating `catia_mcp.log`.
+- pywin32 >= 311; httpx and uvicorn declared directly; CI adds Python 3.13
+  and lints the service modules. `setup.sh` is deprecated in favour of
+  `scripts/install.ps1`.
+
+### Fixed
+- `catia_set_view` used Y-up vectors in Z-up CATIA ('front' showed the top);
+  presets now follow Z-up with orthogonal up vectors (to confirm live).
+- `catia_screenshot` ignored width/height while reporting them, never
+  checked the file and returned only a path; it now verifies the capture
+  and returns the image.
+- `catia_new_part` (3DEXPERIENCE) retried a refused 3D Part up to three
+  times (55 s live); a CATIA refusal now stops at once, is remembered per
+  connection (`CATIA_MCP_DEFAULT_PLM_TYPE` skips it), and file alerts are
+  suppressed around PLMCreate/PLMOpen. `catia_add_new_part` fails fast with
+  the cached refusal.
+- Fillet, chamfer, pad, shaft, groove and hole delete a feature whose update
+  fails (`FEATURE_UPDATE_FAILED`) instead of leaving it broken in the tree;
+  inputs are validated first.
+- Pad sets symmetric/reverse through the parameter fallback and verifies the
+  added volume (`FEATURE_NO_EFFECT`); a hole type CATIA rejects is
+  `WRONG_GEOMETRY_EFFECT` instead of a silent simple hole.
+- Solid features auto-close a sketch still in edition first.
+- Bad input and missing objects are `INVALID_ARGUMENT` / `OBJECT_NOT_FOUND`
+  instead of `COM_ERROR`; Python attribute errors on empty values are
+  `INTERNAL_ERROR` instead of `UNSUPPORTED_CAPABILITY`.
+- `catia_list_features` reported every type as 'unknown'.
+- `catia_get_inertia` returns the InertiaService centre of gravity in mm and
+  keeps 6 significant figures in the inertia matrix.
+- Drawing tools accept 'main' / 'background' view aliases; list_views adds a
+  role per view.
+- CATIA V5 save/close no longer blocks on an overwrite prompt
+  (`DisplayFileAlerts`); open/save refuse relative paths.
+- COM runtime: the worker thread is a proper STA with an OLE message filter,
+  so calls CATIA rejects while busy are retried (then `CATIA_BUSY`) instead
+  of dropping the connection; module caches reset after CATIA restarts;
+  disconnect no longer uninitialises COM under live proxies; shutdown is
+  bounded when CATIA is stuck.
 
 ### Added
 - **CATIA 3DEXPERIENCE (V6) support (123 tools total).** The server detects

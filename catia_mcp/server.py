@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -18,8 +19,10 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, ImageContent, TextContent, Tool
 
 from catia_mcp import __version__
+from catia_mcp.com_thread import BUSY_HRESULTS, hresult, init_worker
 from catia_mcp.connection import CATIAConnection, normalize_platform
 from catia_mcp.errors import CATIAToolError
+from catia_mcp.paths import build_commit, log_path
 from catia_mcp.results import operation_result
 from catia_mcp.tools.assembly import AssemblyTools
 from catia_mcp.tools.diagnostics import DiagnosticsTools
@@ -32,6 +35,7 @@ from catia_mcp.tools.knowledge import KnowledgeTools
 from catia_mcp.tools.measurement import MeasurementTools
 from catia_mcp.tools.part_design import PartDesignTools
 from catia_mcp.tools.plm import PLMTools
+from catia_mcp.tools.session import SessionTools
 from catia_mcp.tools.sketcher import SketcherTools
 
 logger = logging.getLogger("catia_mcp")
@@ -98,6 +102,71 @@ installation's automation reference). catia_undo reverts mistakes.
 """
 
 
+# Tools that manage the connection themselves: status and the API docs must
+# answer while CATIA is not running.
+_NO_AUTO_CONNECT = frozenset(
+    {"catia_connect", "catia_disconnect", "catia_status", "catia_api_search", "catia_api_doc"}
+)
+
+_PY_ATTRIBUTE_ERROR = re.compile(
+    r"^'(NoneType|str|int|float|bool|list|dict|tuple|bytes)' object has no attribute"
+)
+
+# Listed with CATIA_MCP_TOOLSET=core: the Fusion-style surface. The rest
+# stays callable by name.
+CORE_TOOLS = frozenset(
+    {
+        "catia_status",
+        "catia_screenshot",
+        "catia_set_view",
+        "catia_run_python",
+        "catia_inspect_api",
+        "catia_api_search",
+        "catia_api_doc",
+        "catia_undo",
+        "catia_redo",
+        "catia_get_selection",
+        "catia_list_documents",
+        "catia_open_document",
+        "catia_save_document",
+        "catia_close_document",
+        "catia_new_part",
+        "catia_new_product",
+        "catia_activate_document",
+        "catia_get_active_document_info",
+        "catia_list_features",
+        "catia_get_inertia",
+        "catia_measure_distance",
+        "catia_measure_element",
+        "catia_diagnose",
+        "catia_open_from_database",
+        "catia_search_database",
+    }
+)
+
+_READ_ONLY = re.compile(
+    r"^catia_(status|diagnose|inspect_api|api_search|api_doc|screenshot|fit_all|"
+    r"(list|get|measure|search)_.*|.*_list_.*|.*_get_.*)$"
+)
+_DESTRUCTIVE = re.compile(
+    r"^catia_(close_document|delete_.*|run_python|run_script|set_plm_attributes|"
+    r"save_document|disconnect|.*_delete_.*)$"
+)
+
+
+def default_annotations(name: str) -> dict[str, Any]:
+    """MCP tool hints derived from the tool's name (a definition may set its
+    own). Reads change nothing; most writes add features without destroying
+    existing ones."""
+    if _READ_ONLY.match(name):
+        return {"readOnlyHint": True, "openWorldHint": False}
+    return {
+        "readOnlyHint": False,
+        "destructiveHint": bool(_DESTRUCTIVE.match(name)),
+        "openWorldHint": False,
+    }
+
+
 def _preview(arguments: dict[str, Any]) -> str:
     text = repr(arguments)
     return text if len(text) <= 500 else text[:500] + "..."
@@ -143,7 +212,10 @@ class CATIAMCPServer:
         self.connection = CATIAConnection(platform)
         if allow_scripts is None:
             allow_scripts = _env_flag("CATIA_MCP_ALLOW_SCRIPTS")
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="catia-sta")
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="catia-sta", initializer=init_worker
+        )
+        self.allow_scripts = bool(allow_scripts)
         self._started = time.monotonic()
         self._busy: tuple[str, float] | None = None
         self._calls = 0
@@ -164,7 +236,9 @@ class CATIAMCPServer:
         self.export_tools = ExportTools(self.connection)
         self.plm_tools = PLMTools(self.connection)
         self.introspection_tools = IntrospectionTools(self.connection, allow_scripts)
+        self.session_tools = SessionTools(self.connection)
         self._tool_modules = [
+            self.session_tools,
             self.document_tools,
             self.sketcher_tools,
             self.part_design_tools,
@@ -178,6 +252,8 @@ class CATIAMCPServer:
             self.plm_tools,
             self.introspection_tools,
         ]
+        self._generation_seen = self.connection.generation
+        self.toolset = os.environ.get("CATIA_MCP_TOOLSET", "full").strip().lower() or "full"
         self._tool_router: dict[str, Any] = {}
         self._schemas: dict[str, dict] = {}
         for module in self._tool_modules:
@@ -192,15 +268,24 @@ class CATIAMCPServer:
     def _setup_handlers(self) -> None:
         @self.server.list_tools()
         async def handle_list_tools() -> list[Tool]:
-            return [
-                Tool(**definition)
-                for module in self._tool_modules
-                for definition in module.get_tool_definitions()
-            ]
+            return self.list_tools()
 
         @self.server.call_tool(validate_input=False)
         async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> CallToolResult:
             return await self.call_tool(name, arguments or {})
+
+    def list_tools(self) -> list[Tool]:
+        """Every tool, annotated; CATIA_MCP_TOOLSET=core lists only the
+        Fusion-style core (every tool stays callable by name)."""
+        tools = []
+        for module in self._tool_modules:
+            for definition in module.get_tool_definitions():
+                if self.toolset == "core" and definition["name"] not in CORE_TOOLS:
+                    continue
+                definition = dict(definition)
+                definition.setdefault("annotations", default_annotations(definition["name"]))
+                tools.append(Tool(**definition))
+        return tools
 
     # ── Runtime state (read by /health and the busy guard) ──
 
@@ -221,6 +306,10 @@ class CATIAMCPServer:
             "calls": self._calls,
             "busy": busy,
             "catia": dict(self._catia_state),
+            "scripts": self.allow_scripts,
+            "toolset": self.toolset,
+            "commit": build_commit(),
+            "log": str(log_path()),
         }
 
     def _record_connection(self) -> None:
@@ -299,8 +388,9 @@ class CATIAMCPServer:
         logger.info("Tool call: %s(%s)", name, _preview(arguments))
         stage = "connect"
         try:
-            if name not in {"catia_connect", "catia_disconnect"}:
+            if name not in _NO_AUTO_CONNECT:
                 self.connection.ensure_connected()
+            self._reset_stale_modules()
             stage = "connect" if name == "catia_connect" else "execute"
             result = module.execute(name, arguments)
             if isinstance(result, CallToolResult):
@@ -318,8 +408,7 @@ class CATIAMCPServer:
         except Exception as error:
             logger.exception("Tool failed: %s: %s", name, error)  # noqa: TRY401 -- log preview includes the error message
             if self.connection.lost(error):
-                self.connection.app = None
-                self.connection.platform = None
+                self.connection.drop()
                 return failure(
                     "CATIA_NOT_RUNNING",
                     "CATIA closed or stopped responding during the call. Start CATIA "
@@ -328,19 +417,70 @@ class CATIAMCPServer:
                     None,
                     name,
                 )
-            code = "UNSUPPORTED_CAPABILITY" if isinstance(error, AttributeError) else "COM_ERROR"
-            message = str(error)
-            if code == "UNSUPPORTED_CAPABILITY":
+            if hresult(error) in BUSY_HRESULTS:
+                return failure(
+                    "CATIA_BUSY",
+                    "CATIA kept refusing the call because it is busy (a command, a "
+                    "document load or a dialog). Finish or cancel it in CATIA, then retry."
+                    + _dialog_hint(),
+                    stage,
+                    None,
+                    name,
+                )
+            modified = False if stage == "connect" else None
+            if isinstance(error, AttributeError) and _PY_ATTRIBUTE_ERROR.match(str(error)):
+                # A plain Python object (often None where CATIA returned
+                # nothing) lacks the member: not a missing CATIA API.
+                return failure(
+                    "INTERNAL_ERROR",
+                    f"{error}. CATIA returned an unexpected empty or wrong-typed value, or "
+                    "this is a server bug. Check the model state (catia_status) and the log.",
+                    stage,
+                    modified,
+                    name,
+                )
+            if isinstance(error, AttributeError):
                 message = unsupported_message(name, error, self.connection.is_3dx)
-            return failure(code, message, stage, False if stage == "connect" else None, name)
+                return failure("UNSUPPORTED_CAPABILITY", message, stage, modified, name)
+            if isinstance(error, ValueError):
+                return failure("INVALID_ARGUMENT", str(error), stage, modified, name)
+            return failure("COM_ERROR", str(error), stage, modified, name)
+
+    def _reset_stale_modules(self) -> None:
+        """After CATIA was re-attached (restart, disconnect), drop the COM
+        proxies modules cached from the previous process."""
+        generation = self.connection.generation
+        if generation == self._generation_seen:
+            return
+        self._generation_seen = generation
+        for module in self._tool_modules:
+            reset = getattr(module, "reset_session_state", None)
+            if reset is None:
+                continue
+            try:
+                reset()
+            except Exception:  # noqa: BLE001 -- best effort
+                logger.warning("reset_session_state failed for %s", type(module).__name__)
 
     async def close(self) -> None:
+        """Release CATIA on the worker, but never wait on a worker stuck in
+        CATIA (modal dialog): shutdown must stay bounded."""
         try:
-            await asyncio.get_running_loop().run_in_executor(
-                self._executor, self.connection.disconnect
+            await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    self._executor, self.connection.disconnect
+                ),
+                timeout=5.0,
             )
-        finally:
+        except asyncio.TimeoutError:
+            logger.warning("CATIA worker still busy at shutdown; not waiting for it")
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        else:
             self._executor.shutdown(wait=True)
+
+    @property
+    def worker_stuck(self) -> bool:
+        return self._busy is not None
 
     async def run(self) -> None:
         logger.info("Starting CATIA MCP Server: %d tools", len(self._tool_router))
@@ -480,10 +620,12 @@ def main(argv: list[str] | None = None) -> None:
 
         configure_logging(console=True)
         check_bind(args.host, args.token)
+        lock = service.acquire_instance_lock(args.port)
         running = service.health(args.port, token=args.token)
-        if running is not None:
-            logger.info("A CATIA MCP service already runs on port %d (PID %s)", args.port, running.get("pid"))
-            print(f"Already running on port {args.port} (PID {running.get('pid')}).", file=sys.stderr)
+        if lock is None or running is not None:
+            pid = running.get("pid") if running else "?"
+            logger.info("A CATIA MCP service already runs on port %d (PID %s)", args.port, pid)
+            print(f"Already running on port {args.port} (PID {pid}).", file=sys.stderr)
             return
         server = CATIAMCPServer(args.platform, args.allow_scripts)
         service.write_pid_file(args.port)
@@ -491,6 +633,11 @@ def main(argv: list[str] | None = None) -> None:
             asyncio.run(server.run_http(args.host, args.port, args.token))
         finally:
             service.clear_pid_file()
+        if server.worker_stuck:
+            # The worker thread is blocked inside CATIA and would keep the
+            # interpreter from exiting; nothing else is left to clean up.
+            logging.shutdown()
+            os._exit(0)
         return
     configure_logging(console=True)
     asyncio.run(CATIAMCPServer(args.platform, args.allow_scripts).run())

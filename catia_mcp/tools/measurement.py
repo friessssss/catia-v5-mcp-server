@@ -19,6 +19,8 @@ from catia_mcp.measure import (
     M_TO_MM,
     UNIT_NOTE_3DX,
     Measurer,
+    inertia_cog_to_mm,
+    significant,
 )
 from catia_mcp.references import search_final_topology
 
@@ -48,6 +50,11 @@ class MeasurementTools:
     def __init__(self, connection: CATIAConnection) -> None:
         self.conn = connection
         self.measure = Measurer(connection)
+
+    def reset_session_state(self) -> None:
+        """Drop per-session caches (CATMeasurableType codes / enum). The
+        server calls this after CATIA reconnects."""
+        self.measure.reset_session_state()
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
         return [
@@ -278,6 +285,7 @@ class MeasurementTools:
         except Exception as e:
             result["area_mm2"] = f"unavailable: {e}"
 
+        cog: list[float] | None = None
         try:
             # GetCOG coordinates come back in the document's length unit
             # (mm), not MKS: field-observed on V5R20 for GetPlane/GetCOG.
@@ -303,17 +311,35 @@ class MeasurementTools:
             result["mass_from_material_kg"] = round(inertia["mass_kg"], 6)
             matrix = inertia.get("matrix")
             if matrix:
-                result["inertia_matrix_kg_m2"] = [
-                    [round(matrix[0], 4), round(matrix[1], 4), round(matrix[2], 4)],
-                    [round(matrix[3], 4), round(matrix[4], 4), round(matrix[5], 4)],
-                    [round(matrix[6], 4), round(matrix[7], 4), round(matrix[8], 4)],
-                ]
+                # 6 significant figures: moments of a 100 mm part are ~1e-4
+                # kg.m2, which 4 fixed decimals rounded to 0.0008 / 0.0.
+                values = [significant(v) for v in matrix]
+                result["inertia_matrix_kg_m2"] = [values[0:3], values[3:6], values[6:9]]
             else:
                 result["inertia_matrix_kg_m2"] = f"unavailable: {inertia.get('matrix_error')}"
-            if "cog_raw" in inertia:
-                result["inertia_cog_raw"] = [round(v, 6) for v in inertia["cog_raw"]]
         except Exception as e:
+            inertia = {}
             result["inertia_matrix_kg_m2"] = f"unavailable: {e}"
+        if "cog_raw" in inertia:
+            # Separate from the matrix block so a malformed COG cannot replace
+            # an already computed matrix with "unavailable".
+            try:
+                inertia_cog, unit_basis = inertia_cog_to_mm(inertia["cog_raw"], cog)
+                result["inertia_cog_mm"] = {
+                    "x": round(inertia_cog[0], 4),
+                    "y": round(inertia_cog[1], 4),
+                    "z": round(inertia_cog[2], 4),
+                }
+                result["inertia_cog_unit_basis"] = unit_basis
+            except Exception as e:
+                result["inertia_cog_mm"] = f"unavailable: {e}"
+            else:
+                if cog is None:
+                    # The measurable COG failed: report the inertia COG in
+                    # its place, labelled with where it came from.
+                    result["center_of_gravity_measurable_error"] = result["center_of_gravity_mm"]
+                    result["center_of_gravity_mm"] = dict(result["inertia_cog_mm"])
+                    result["center_of_gravity_source"] = "InertiaService (" + unit_basis + ")"
 
         if self.conn.is_3dx:
             result["units_note"] = UNIT_NOTE_3DX

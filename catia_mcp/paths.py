@@ -38,11 +38,13 @@ def log_path() -> Path:
 
 def configure_logging(console: bool = True) -> Path:
     """Log to a rotating file in the state directory, plus stderr when one
-    exists. Under pythonw.exe stdout/stderr are None; they are pointed at the
-    log so third-party prints (uvicorn, pywin32) cannot crash the process."""
+    exists. Under pythonw.exe stdout/stderr are None; they are pointed at a
+    separate stdio.log (never the rotated log: Windows cannot rename a file
+    another handle keeps open) so stray prints cannot crash the process."""
     path = log_path()
     if sys.stderr is None or sys.stdout is None:
-        stream = open(path, "a", encoding="utf-8", buffering=1)  # noqa: SIM115 -- process lifetime
+        stdio = state_dir() / "stdio.log"
+        stream = open(stdio, "w", encoding="utf-8", buffering=1)  # noqa: SIM115 -- process lifetime
         if sys.stdout is None:
             sys.stdout = stream
         if sys.stderr is None:
@@ -62,4 +64,47 @@ def configure_logging(console: bool = True) -> Path:
         handler.setFormatter(logging.Formatter(LOG_FORMAT))
         root.addHandler(handler)
     root.setLevel(logging.INFO)
+    # The proxy and `status` poll /health; per-request client logs are noise.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     return path
+
+
+_COMMIT: list[str | None] = []
+
+
+def build_commit() -> str | None:
+    """Git commit this code was installed from, so a tester can confirm they
+    run the latest push. Read from the PEP 610 direct_url.json of a
+    `uv tool install git+...` / `pip install git+...`, else from the
+    checkout of an editable install."""
+    if _COMMIT:
+        return _COMMIT[0]
+    commit = None
+    try:
+        import json
+        from importlib.metadata import distribution
+
+        text = distribution("catia-v5-mcp-server").read_text("direct_url.json")
+        if text:
+            info = json.loads(text)
+            commit = (info.get("vcs_info") or {}).get("commit_id")
+    except Exception:  # noqa: BLE001 -- informational
+        commit = None
+    if commit is None:
+        repo = Path(__file__).resolve().parent.parent
+        if (repo / ".git").exists():
+            import subprocess
+
+            try:
+                done = subprocess.run(
+                    ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                commit = done.stdout.strip() or None
+            except (OSError, subprocess.SubprocessError):
+                commit = None
+    _COMMIT.append(commit[:12] if commit else None)
+    return _COMMIT[0]

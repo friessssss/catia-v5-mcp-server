@@ -25,6 +25,12 @@ coordinates), the axis system being 12 values (origin, 3 axes).
 Units, live-checked on 3DEXPERIENCE R428 SP6 against a 100 x 60 x 40 mm
 block: volume and area come back in MKS (converted like V5); coordinates and
 DistanceMinTo come back in mm.
+
+InertiaService GetCOGPosition: the R428 SP6 smoke run (smoke_report_before_
+fixes.json) returned [0.0, 0.0, 0.02] for a part whose centre of gravity is
+at z = 20 mm, i.e. metres. It is converted to mm by cross-checking against
+the measurable COG when both exist (the scale that agrees within 1% wins),
+else by assuming metres as observed.
 """
 
 from __future__ import annotations
@@ -79,6 +85,43 @@ _VBS_INERTIA_V5 = (
 )
 
 
+def significant(value: float, digits: int = 6) -> float:
+    """Round to `digits` significant figures. Inertia moments in kg.m2 are
+    small (1e-4 for a 100 mm steel block), so fixed decimals would erase them."""
+    return float(f"{float(value):.{digits}g}")
+
+
+# Candidate scales from the raw InertiaService COG to mm, most likely first
+# (metres per the R428 SP6 smoke run, then already-mm).
+_COG_SCALES = ((M_TO_MM, "m"), (1.0, "mm"))
+
+
+def inertia_cog_to_mm(
+    raw: list[float], reference_mm: list[float] | None = None
+) -> tuple[list[float], str]:
+    """Convert an InertiaService COG to mm. Returns (cog_mm, how the unit was
+    decided). With a measurable COG in mm to compare against, the scale whose
+    result agrees within 1% (of the COG distance from the origin; 1e-3 mm
+    absolute floor) is used; otherwise metres are assumed (field evidence)."""
+    values = [float(v) for v in raw]
+    if reference_mm is not None and len(reference_mm) == 3:
+        ref = [float(v) for v in reference_mm]
+        norm = max(abs(v) for v in ref)
+        tolerance = max(0.01 * norm, 1e-3)
+        for scale, unit in _COG_SCALES:
+            scaled = [v * scale for v in values]
+            if all(abs(a - b) <= tolerance for a, b in zip(scaled, ref)):
+                return scaled, f"raw {unit}; agrees with the measurable COG within 1%"
+        return [v * M_TO_MM for v in values], (
+            "raw assumed m (R428 SP6 field evidence); does NOT agree with the measurable "
+            "COG in either m or mm, so treat it with care"
+        )
+    return [v * M_TO_MM for v in values], (
+        "raw assumed m (R428 SP6 field evidence: 0.02 for a COG at 20 mm); no measurable "
+        "COG to cross-check"
+    )
+
+
 class Measurer:
     """Platform-neutral measurements. Every value is returned in mm-based
     units (mm, mm2, mm3) or kg / kg.m2."""
@@ -87,6 +130,14 @@ class Measurer:
         self.conn = connection
         self._codes: dict[str, int] = {}
         self._enum: dict[str, int] | None = None
+        self._enum_read = False
+
+    def reset_session_state(self) -> None:
+        """Forget the CATMeasurableType codes/enum read from the previous
+        CATIA session (call after a reconnect: a restarted or different
+        CATIA may be another release with other enum values)."""
+        self._codes = {}
+        self._enum = None
         self._enum_read = False
 
     # ── V5 ──
@@ -314,7 +365,9 @@ class Measurer:
         except Exception as e:
             result["matrix_error"] = str(e)
         try:
-            # Unit not established (m on some releases, mm on others): raw.
+            # Raw: metres on R428 SP6 (see the module docstring). The caller
+            # converts with inertia_cog_to_mm once it has a measurable COG to
+            # cross-check against.
             result["cog_raw"] = self._triple(element, "GetCOGPosition")
         except Exception:
             pass

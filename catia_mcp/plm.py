@@ -17,10 +17,21 @@ Recipes (field-documented for 3DEXPERIENCE automation):
 
 PLMCreate and PLMOpen return the editor through an out-parameter, so they
 run through the SystemService.Evaluate detour (automation.call_out_object).
+
+Field evidence (R428 SP6, smoke_report_before_fixes.json): a site without the
+3D Part role answers PLMCreate "3DPart" with a CATScript error whose source is
+"CATIAPLMNewService" and description "The method PLMCreate failed". That is
+CATIA refusing the call, not the Evaluate detour failing, so retrying through
+the direct (pywin32 out-parameter) call only cost time: catia_new_part took
+~55 s before falling back to a 3D Shape. Refusals are now raised at once and
+remembered per connection, so later 'auto' creations go straight to 3D Shape.
 """
 
 from __future__ import annotations
 
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from catia_mcp.automation import (
@@ -32,7 +43,12 @@ from catia_mcp.automation import (
     safe_get,
 )
 from catia_mcp.connection import CATIAConnection
-from catia_mcp.errors import AmbiguousTarget, ObjectNotFound, UnsupportedCapability
+from catia_mcp.errors import (
+    AmbiguousTarget,
+    InvalidArgument,
+    ObjectNotFound,
+    UnsupportedCapability,
+)
 
 # Attributes read for search results and attribute reports. Not every type
 # carries every attribute; missing ones are skipped.
@@ -61,9 +77,100 @@ CREATE_TYPES = {
 }
 
 
+# Environment variable naming the PLM type 'auto' part creation starts with.
+# "3DShape" skips the 3D Part attempt entirely (sites without the role).
+DEFAULT_PLM_TYPE_ENV = "CATIA_MCP_DEFAULT_PLM_TYPE"
+
+# Attribute set on the CATIAConnection (connection.py is not owned here) that
+# remembers PLMCreate refusals: (app object, {plm_type: refusal text}). The
+# app object is kept so a reconnect (new Application proxy) starts afresh.
+_REFUSALS_ATTR = "_plm_create_refusals"
+
+
 def _not_authorized(error: Exception) -> bool:
     text = str(error).lower()
     return "not authorized" in text or "not allowed" in text or "licen" in text
+
+
+def catia_refused(error: Exception) -> bool:
+    """True when the failure text shows CATIA itself ran PLMCreate/PLMOpen
+    and refused it (field text: "Source: CATIAPLMNewService / Description:
+    The method PLMCreate failed"), as opposed to the Evaluate machinery
+    failing before the call. Only the latter is worth a direct-call retry."""
+    text = str(error)
+    lowered = text.lower()
+    return (
+        "PLMCreate failed" in text
+        or "CATIAPLMNewService" in text
+        or "PLMOpen failed" in text
+        or "CATIAPLMOpenService" in text
+        or "method plmcreate failed" in lowered
+        or _not_authorized(error)
+    )
+
+
+def refusal_summary(error: Exception) -> str:
+    """Short human-readable refusal: the CATScript Description line when the
+    COM error carries one, else the error text (bounded)."""
+    text = str(error).replace("\\n", "\n")
+    for line in text.splitlines():
+        if "Description:" in line:
+            return line.split("Description:", 1)[1].strip().rstrip(")").strip()
+    return text if len(text) <= 300 else text[:297] + "..."
+
+
+def normalize_create_type(value: str | None) -> str | None:
+    if not value:
+        return None
+    key = value.strip().lower().replace(" ", "").replace("-", "")
+    return CREATE_TYPES.get(key)
+
+
+def default_part_type() -> str | None:
+    """CATIA_MCP_DEFAULT_PLM_TYPE as a PLM type ('3DPart' / '3DShape'), or None."""
+    raw = os.environ.get(DEFAULT_PLM_TYPE_ENV)
+    kind = normalize_create_type(raw)
+    if raw and kind not in ("3DPart", "3DShape"):
+        raise InvalidArgument(
+            f"{DEFAULT_PLM_TYPE_ENV}={raw!r} is not a part type; use '3DPart' or '3DShape'."
+        )
+    return kind
+
+
+class PLMCreateRefused(UnsupportedCapability):
+    """CATIA ran PLMCreate and refused it (licence / role / site rules)."""
+
+    def __init__(self, plm_type: str, error: Exception, *, modified: bool | None, cached: bool = False):
+        self.plm_type = plm_type
+        self.reason = refusal_summary(error)
+        prefix = "earlier in this session " if cached else ""
+        super().__init__(
+            f"3DEXPERIENCE {prefix}refused to create a {plm_type} (PLMCreate: {self.reason}).",
+            modified=modified,
+        )
+
+
+@contextmanager
+def file_alerts_off(app: Any) -> Iterator[None]:
+    """Set app.DisplayFileAlerts = False for the block and restore it after,
+    so a file/save/overwrite prompt cannot block the COM call (and with it the
+    server's worker). Skipped when the member does not exist."""
+    previous = safe_get(app, "DisplayFileAlerts")
+    changed = False
+    if previous is not None:
+        try:
+            app.DisplayFileAlerts = False
+            changed = True
+        except Exception:
+            changed = False
+    try:
+        yield
+    finally:
+        if changed:
+            try:
+                app.DisplayFileAlerts = previous
+            except Exception:
+                pass
 
 
 class PLMSession:
@@ -92,42 +199,139 @@ class PLMSession:
 
     # ── Create / open / save ──
 
+    # ── Refusal cache (per connection) ──
+
+    def refusals(self) -> dict[str, str]:
+        """PLMCreate refusals recorded for the current CATIA Application.
+        Cleared automatically when the connection holds a new Application
+        (reconnect) or explicitly by reset_refusals()."""
+        cached = getattr(self.conn, _REFUSALS_ATTR, None)
+        app = self.conn.app
+        if not cached or cached[0] is not app:
+            cached = (app, {})
+            setattr(self.conn, _REFUSALS_ATTR, cached)
+        return cached[1]
+
+    def refused(self, plm_type: str) -> str | None:
+        return self.refusals().get(plm_type)
+
+    def reset_refusals(self) -> None:
+        setattr(self.conn, _REFUSALS_ATTR, None)
+
+    # ── Create / open / save ──
+
     def create(self, plm_type: str) -> Any:
-        """PLMCreate one object and return its (now active) editor."""
+        """PLMCreate one object and return its (now active) editor.
+
+        Raises PLMCreateRefused at once when CATIA ran the call and refused
+        it (recorded in the refusal cache); the direct-call retry is kept
+        only for failures of the Evaluate detour itself."""
         service = self.conn.session_service("PLMNewService")
         before = self.editor_count()
-        try:
-            editor = call_out_object(self.conn.app, service, "PLMCreate", plm_type)
-        except Exception as script_error:
-            after = self.editor_count()
-            if before is not None and after is not None and after > before:
-                # The object was created but the out-parameter could not be
-                # read back: the new editor is the active one.
-                return self.conn.active_editor
-            if _not_authorized(script_error):
-                raise
+        app = self.conn.app
+        with file_alerts_off(app):
             try:
-                # pywin32 with type information returns out-parameters.
-                editor = service.PLMCreate(plm_type)
-            except Exception:
-                raise script_error
+                editor = call_out_object(app, service, "PLMCreate", plm_type)
+            except Exception as script_error:
+                after = self.editor_count()
+                if before is not None and after is not None and after > before:
+                    # The object was created but the out-parameter could not
+                    # be read back: the new editor is the active one.
+                    self.refusals().pop(plm_type, None)
+                    return self.conn.active_editor
+                counted = before is not None and after is not None
+                if catia_refused(script_error):
+                    refusal = PLMCreateRefused(
+                        plm_type, script_error, modified=False if counted else None
+                    )
+                    self.refusals()[plm_type] = refusal.reason
+                    raise refusal from script_error
+                try:
+                    # pywin32 with type information returns out-parameters.
+                    editor = service.PLMCreate(plm_type)
+                except Exception:
+                    raise script_error from None
+        # Success (e.g. an explicit retry after a role change): forget any
+        # earlier refusal so later 'auto' calls try this type again.
+        self.refusals().pop(plm_type, None)
         if editor is None or not resolves(editor, "ActiveObject"):
             editor = self.conn.active_editor
         return editor
 
+    def create_part(self, plm_type: str = "auto") -> tuple[str, str]:
+        """Create a part-like object ('auto', '3DPart' or '3DShape') and
+        return (created type, note explaining any fallback).
+
+        'auto' starts with CATIA_MCP_DEFAULT_PLM_TYPE when set, skips a type
+        this connection already saw refused, and falls back from 3D Part to
+        3D Shape on a refusal. An explicit type is always attempted (the
+        refusal may have been lifted) and never falls back."""
+        if plm_type != "auto":
+            self.create(plm_type)
+            return plm_type, ""
+        default = default_part_type()
+        attempts = ["3DShape"] if default == "3DShape" else ["3DPart", "3DShape"]
+        notes: list[str] = []
+        if default == "3DShape":
+            notes.append(
+                f"{DEFAULT_PLM_TYPE_ENV}=3DShape, so no 3D Part was attempted; a 3D "
+                "Shape has no product node of its own."
+            )
+        refusals: list[str] = []
+        for kind in list(attempts):
+            cached = self.refused(kind)
+            if cached is not None and kind != attempts[-1]:
+                notes.append(
+                    f"A {kind} was refused earlier in this session ({cached}), so a "
+                    f"{attempts[-1]} was created directly; it has no product node of "
+                    f"its own. Reconnect or pass plm_type='{kind}' to try again."
+                )
+                continue
+            try:
+                self.create(kind)
+            except Exception as error:  # 'auto' falls back on any failure
+                reason = error.reason if isinstance(error, PLMCreateRefused) else refusal_summary(error)
+                refusals.append(f"{kind}: {reason}")
+                if kind == attempts[-1]:
+                    raise UnsupportedCapability(
+                        "3DEXPERIENCE refused to create the part ("
+                        + "; ".join(refusals)
+                        + "). Check that you are logged in, have a collaborative space "
+                        "selected, and hold a role allowing creation.",
+                        modified=getattr(error, "modified", None),
+                    ) from error
+                later = (
+                    f" Later 'auto' creations in this session go straight to {attempts[-1]}."
+                    if isinstance(error, PLMCreateRefused)
+                    else ""
+                )
+                notes.append(
+                    f"A {kind} could not be created ({reason}), so a {attempts[-1]} was "
+                    f"created instead; it has no product node of its own.{later}"
+                )
+                continue
+            return kind, " ".join(notes)
+        raise AssertionError("unreachable")  # pragma: no cover
+
     def open_entity(self, entity: Any) -> Any:
         service = self.conn.session_service("PLMOpenService")
         before = self.editor_count()
-        try:
-            editor = call_out_object(self.conn.app, service, "PLMOpen", entity)
-        except Exception as script_error:
-            after = self.editor_count()
-            if before is not None and after is not None and after > before:
-                return self.conn.active_editor
+        app = self.conn.app
+        with file_alerts_off(app):
             try:
-                editor = service.PLMOpen(entity)
-            except Exception:
-                raise script_error
+                editor = call_out_object(app, service, "PLMOpen", entity)
+            except Exception as script_error:
+                after = self.editor_count()
+                if before is not None and after is not None and after > before:
+                    return self.conn.active_editor
+                if catia_refused(script_error):
+                    # CATIA ran PLMOpen and refused it; a direct retry would
+                    # only repeat the refusal (see the module docstring).
+                    raise
+                try:
+                    editor = service.PLMOpen(entity)
+                except Exception:
+                    raise script_error from None
         if editor is None or not resolves(editor, "ActiveObject"):
             editor = self.conn.active_editor
         return editor

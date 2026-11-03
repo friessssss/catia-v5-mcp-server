@@ -10,11 +10,18 @@
 
 The first open-source MCP server for CATIA V5, now also driving CATIA on the 3DEXPERIENCE platform. Drive parametric CAD modeling, measurement, drawing export and COM automation in natural language, from any AI agent that speaks MCP. The platform is detected when the server connects; the same tools work on both.
 
+Install it once and it runs in the background, like Autodesk's Fusion MCP: a
+local endpoint at `http://127.0.0.1:8765/mcp` shared by every client, that
+attaches to CATIA whenever you start it. The agent can see the model
+(`catia_screenshot` returns the picture from any view direction), run Python
+against the live CATIA API, search the installation's own API reference, and
+undo its mistakes.
+
 ![Repository traffic](traffic/chart.png)
 
 ## What it does
 
-This MCP server exposes **123 tools** that let an AI agent:
+This MCP server exposes **about 130 tools** that let an AI agent:
 
 - **Create and manage documents** — new Part, Product (assembly), open, save, close; on 3DEXPERIENCE: 3D Parts / 3D Shapes / Physical Products in session, saved to the 3DSpace database
 - **3DEXPERIENCE PLM** — search the database, open objects by title/revision, read and write PLM attributes, product tree
@@ -25,16 +32,17 @@ This MCP server exposes **123 tools** that let an AI agent:
 - **Measurement** — distance, inertia, bounding box, per-element measures, parameters
 - **Knowledgeware** — user parameters, formulas, design tables, relations
 - **Export** — STEP, IGES, STL, 3DXML, VRML, screenshots
-- **View control** — set standard views, fit all, capture screenshots
+- **See the model** — screenshots returned to the agent as images, from 15 view presets (front/back/left/right/top/bottom, isometric and 8 corner isometrics) or any direction
+- **Session** — status of the CATIA session, the user's current selection, undo / redo
 - **Drafting** — Drawing documents, generative views (axis- or face-driven), projection/section/detail views, 3D-driven dimensions, text and tables (experimental, field-contributed)
 - **Diagnostics** — report the platform and CATIA release and probe which automation APIs the installation exposes
-- **API discovery** — inspect the live automation API (members, parameters, enum values) from CATIA's type library, and optionally run VBScript inside CATIA (opt-in)
+- **Scripting and API discovery** — run Python against the live COM objects (`catia_run_python`, the escape hatch for anything no tool covers), search and read the installation's automation reference (`DSYAutomation.chm` / `V5Automation.chm`), inspect live members and enum values from CATIA's type library, run VBScript inside CATIA
 
 ## Requirements
 
 - **Windows** (COM automation is Windows-only)
 - **CATIA V5** installed and licensed (R2016+), **or CATIA on the 3DEXPERIENCE platform** (the native app, started and logged in; see [CATIA 3DEXPERIENCE (V6)](#catia-3dexperience-v6))
-- **Python 3.10+**
+- **Python 3.10+** (the installer brings its own Python 3.13 through uv; nothing to install by hand)
 - Any **MCP client**: Claude Desktop, Claude Code, Cursor, Windsurf, Cline, VS Code (Copilot/MCP), Codex CLI, ChatGPT via an HTTP bridge, and others
 
 ### Compatibility notes (field reports)
@@ -104,113 +112,82 @@ shows what your release exposes.
 
 ## Quick Install (Recommended)
 
-```bash
-git clone https://github.com/daiemon12/catia-v5-mcp-server.git
-cd catia-v5-mcp-server
-bash setup.sh
+On the Windows machine that runs CATIA, open **PowerShell** and run (no
+administrator rights needed):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/friessssss/catia-v5-mcp-server/main/scripts/install.ps1 | iex"
 ```
 
-The script handles everything: dependencies, Claude Desktop configuration, and verification. Using another MCP client? See the per-client setup below.
+That one line:
 
-## Manual Installation
+1. installs [uv](https://docs.astral.sh/uv/) in your profile if it is missing, and the server with its own Python 3.13;
+2. runs `catia-mcp install`, which starts the background service now and at every logon (`http://127.0.0.1:8765/mcp`, health at `http://127.0.0.1:8765/health`);
+3. adds a `catia` server to Claude Desktop (through `catia-mcp proxy`) and, if the CLI is installed, to Claude Code (`claude mcp add --scope user --transport http catia http://127.0.0.1:8765/mcp`);
+4. prints `catia-mcp status`.
 
-### 1. Clone the repository
+Then restart Claude Desktop, start CATIA (on 3DEXPERIENCE: from the launcher,
+logged in), and ask: *"Create a new CATIA part with a 100 x 60 x 40 mm block
+and show me a screenshot."* Re-run the same line to upgrade.
 
-```bash
-git clone https://github.com/daiemon12/catia-v5-mcp-server.git
-cd catia-v5-mcp-server
+Day to day:
+
+```bat
+catia-mcp status      :: running? version and commit, CATIA connection, busy call, log path
+catia-mcp stop        :: stop the service (autostart brings it back at logon)
+catia-mcp start       :: start it again
+catia-mcp uninstall   :: remove autostart and the Claude client entries
 ```
 
-### 2. Install dependencies
+Install a test branch with `-Branch` (from a checkout: `scripts\install.cmd -Branch my-branch`;
+from the web: see [docs/background-service.md](docs/background-service.md)),
+and remove everything with `scripts\install.cmd -Uninstall`. How the service
+works, logs, timeouts, environment variables and troubleshooting:
+[docs/background-service.md](docs/background-service.md).
 
-```bash
-pip install -e .
-```
+## Connecting other MCP clients
 
-Or manually:
-```bash
-pip install mcp pywin32
-```
-
-### 3. Connect your MCP client
-
-The server speaks standard MCP over stdio, so it works with every
-MCP-compatible client. The command is always the same:
-`python -m catia_mcp` (or an absolute path to `catia_mcp/server.py`).
+Clients that speak Streamable HTTP connect straight to the service at
+`http://127.0.0.1:8765/mcp`. Clients that only launch local commands run
+`catia-mcp proxy`, a stdio bridge to the same service (it starts the service
+if needed). Use the absolute path of `catia-mcp.exe`
+(`%USERPROFILE%\.local\bin\catia-mcp.exe`) if the client does not see your PATH.
 
 <details>
-<summary><b>Claude Desktop</b></summary>
+<summary><b>Claude Code</b> (done by the installer)</summary>
 
-Edit the config file:
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "catia-v5": {
-      "command": "python",
-      "args": ["-m", "catia_mcp"]
-    }
-  }
-}
+```bash
+claude mcp add --scope user --transport http catia http://127.0.0.1:8765/mcp
 ```
 </details>
 
 <details>
-<summary><b>Claude Code</b></summary>
+<summary><b>Claude Desktop</b> (done by the installer)</summary>
 
-```bash
-claude mcp add catia-v5 python -- -m catia_mcp
+`%APPDATA%\Claude\claude_desktop_config.json` (Microsoft Store build:
+`%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "catia": {
+      "command": "C:\\Users\\you\\AppData\\Roaming\\uv\\tools\\catia-v5-mcp-server\\Scripts\\python.exe",
+      "args": ["-m", "catia_mcp", "proxy"]
+    }
+  }
+}
 ```
 </details>
 
 <details>
 <summary><b>Cursor</b></summary>
 
-Add to `~/.cursor/mcp.json` (or `.cursor/mcp.json` in your project):
+`~/.cursor/mcp.json` (or `.cursor/mcp.json` in your project):
 
 ```json
 {
   "mcpServers": {
-    "catia-v5": {
-      "command": "python",
-      "args": ["-m", "catia_mcp"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Windsurf</b></summary>
-
-Add to `~/.codeium/windsurf/mcp_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "catia-v5": {
-      "command": "python",
-      "args": ["-m", "catia_mcp"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Cline</b></summary>
-
-In VS Code: Cline icon > MCP Servers > Configure, then add:
-
-```json
-{
-  "mcpServers": {
-    "catia-v5": {
-      "command": "python",
-      "args": ["-m", "catia_mcp"]
-    }
+    "catia": { "url": "http://127.0.0.1:8765/mcp" }
   }
 }
 ```
@@ -219,77 +196,108 @@ In VS Code: Cline icon > MCP Servers > Configure, then add:
 <details>
 <summary><b>VS Code (GitHub Copilot / native MCP)</b></summary>
 
-Add to `.vscode/mcp.json`:
+`.vscode/mcp.json`:
 
 ```json
 {
   "servers": {
-    "catia-v5": {
-      "type": "stdio",
-      "command": "python",
-      "args": ["-m", "catia_mcp"]
-    }
+    "catia": { "type": "http", "url": "http://127.0.0.1:8765/mcp" }
   }
 }
 ```
 </details>
 
 <details>
-<summary><b>Codex CLI (OpenAI)</b></summary>
+<summary><b>Windsurf, Cline, Codex CLI and other stdio-only hosts</b></summary>
 
-Add to `~/.codex/config.toml`:
+Configure a stdio server named `catia` with command `catia-mcp` and args
+`["proxy"]`. Windsurf (`~/.codeium/windsurf/mcp_config.json`) and Cline:
+
+```json
+{
+  "mcpServers": {
+    "catia": { "command": "catia-mcp", "args": ["proxy"] }
+  }
+}
+```
+
+Codex CLI (`~/.codex/config.toml`):
 
 ```toml
-[mcp_servers.catia-v5]
-command = "python"
-args = ["-m", "catia_mcp"]
+[mcp_servers.catia]
+command = "catia-mcp"
+args = ["proxy"]
 ```
 </details>
 
 <details>
 <summary><b>ChatGPT (desktop / web)</b></summary>
 
-ChatGPT only connects to remote MCP servers over HTTP, not to local
-stdio processes. Expose this server through a stdio-to-HTTP bridge such
-as `mcp-proxy` or `supergateway` on the CATIA machine, then add the
-resulting URL as a connector in ChatGPT's developer mode. A native HTTP
-transport is on the roadmap.
+ChatGPT only connects to remote MCP servers over public HTTPS with OAuth,
+which this server does not provide. Use a desktop or CLI client.
 </details>
 
-<details>
-<summary><b>Other MCP hosts</b></summary>
+### Without the background service (classic stdio)
 
-Any client that launches stdio MCP servers works: configure a server
-named `catia-v5` with command `python` and args `["-m", "catia_mcp"]`,
-run from a machine where CATIA V5 is installed.
-</details>
+The server still runs as a plain stdio process started by the client, as in
+0.2.x. Each client then has its own CATIA connection, and nothing runs when
+no client is open.
+
+```bash
+git clone https://github.com/friessssss/catia-v5-mcp-server.git
+cd catia-v5-mcp-server
+pip install -e ".[images]"
+```
+
+```json
+{
+  "mcpServers": {
+    "catia": {
+      "command": "python",
+      "args": ["-m", "catia_mcp"]
+    }
+  }
+}
+```
+
+Claude Code: `claude mcp add catia python -- -m catia_mcp`. `setup.sh` is
+deprecated; it now calls `scripts/install.ps1`.
 
 ### Remote use: agent on a Mac or another machine
 
-CATIA only runs on Windows, but the agent does not have to. Start the server
-in HTTP mode next to CATIA (local PC or cloud workstation) and connect from a
-Mac with Claude Code, Cursor, VS Code or Claude Desktop:
+CATIA only runs on Windows, but the agent does not have to. Reach the
+service on the CATIA machine (local PC or cloud workstation) from a Mac with
+Claude Code, Cursor, VS Code or Claude Desktop, through an SSH tunnel to the
+loopback service, or by serving on the network with a token:
 
 ```bat
+catia-mcp stop
 catia-mcp --new-token
 set CATIA_MCP_TOKEN=<token>
-catia-mcp --http --host 0.0.0.0
+catia-mcp serve --host 0.0.0.0
 ```
 
-The server refuses to listen beyond localhost without a token, and should be
-reached through a private network such as Tailscale or an SSH tunnel, never
-the open internet. Full setup and client configurations:
+The server refuses to listen beyond localhost without a token, disables the
+script tools there unless `--allow-scripts` is given, and should be reached
+through a private network such as Tailscale or an SSH tunnel, never the open
+internet. Full setup and client configurations:
 [docs/remote-access.md](docs/remote-access.md).
 
-### 4. Start CATIA
+### Start CATIA
 
-Make sure CATIA is running before asking your agent to interact with it. The server will automatically connect to the running instance and detect whether it is CATIA V5 or CATIA 3DEXPERIENCE.
+The server attaches to the CATIA you are running and detects whether it is
+CATIA V5 or CATIA 3DEXPERIENCE; no connect call is needed. If CATIA is not
+running, tools fail with `CATIA_NOT_RUNNING` until you start it (on
+3DEXPERIENCE: from the launcher, logged in to your platform and
+collaborative space). Set `CATIA_MCP_LAUNCH=1` to let a tool call launch
+CATIA V5 instead (requires `cnext.exe /regserver`).
 
-If CATIA V5 is not running, the server will attempt to launch it (requires CATIA to be registered as COM server: `cnext.exe /regserver`). For 3DEXPERIENCE, start the native app from the 3DEXPERIENCE launcher and log in to your platform and collaborative space before connecting.
-
-Optional server flags: `--platform auto|v5|3dx` forces the platform;
-`--allow-scripts` enables `catia_run_script` (VBScript inside CATIA with
-your full rights; off by default).
+Server options: `--platform auto|v5|3dx` (or `CATIA_MCP_PLATFORM`) forces
+the platform. The script tools (`catia_run_python`, `catia_run_script`) are
+on for stdio and loopback, off for a server listening on the network unless
+`--allow-scripts`; `--no-scripts` or `CATIA_MCP_ALLOW_SCRIPTS=0` disables
+them. All environment variables are listed in
+[docs/background-service.md](docs/background-service.md#environment-variables).
 
 ## Usage Examples
 
@@ -328,7 +336,13 @@ catia-v5-mcp-server/
 │   ├── automation.py        # COM helpers (out-parameters via SystemService.Evaluate)
 │   ├── introspect.py        # Live type-library reading (members, enums)
 │   ├── errors.py            # Typed tool failures (stable error codes)
-│   ├── http_transport.py    # Optional remote access (Streamable HTTP + token)
+│   ├── results.py           # Structured result envelope (ok / code / effects)
+│   ├── http_transport.py    # Streamable HTTP endpoint (/mcp, /health, token)
+│   ├── service.py           # Background service: install, autostart, status, stop
+│   ├── proxy.py             # stdio <-> HTTP bridge for Claude Desktop
+│   ├── paths.py             # Per-user state dir and log (%LOCALAPPDATA%\catia-mcp)
+│   ├── winutil.py           # CATIA dialog detection without COM
+│   ├── apidocs.py           # Search the installed automation reference (CHM)
 │   └── tools/
 │       ├── __init__.py
 │       ├── document.py      # Documents / editors (10 tools)
@@ -341,8 +355,13 @@ catia-v5-mcp-server/
 │       ├── drawing.py       # Drafting: drawings, views, dimensions, text & tables (12 tools)
 │       ├── knowledge.py     # Knowledgeware: parameters, formulas, design tables (5 tools)
 │       ├── diagnostics.py   # Installation diagnostics (1 tool)
-│       ├── introspection.py # API discovery and opt-in scripting (2 tools)
+│       ├── introspection.py # API discovery, Python and VBScript scripting
+│       ├── session.py       # Status, selection, undo/redo, API reference search
 │       └── export.py        # Export & view control (4 tools)
+├── scripts/
+│   ├── install.ps1          # One-shot installer (uv + catia-mcp install)
+│   ├── install.cmd          # Same, runnable from cmd / Explorer
+│   └── live_smoke_test.py   # Live end-to-end test (in-process or via --url)
 ├── pyproject.toml
 ├── requirements.txt
 └── README.md
@@ -351,9 +370,13 @@ catia-v5-mcp-server/
 ### How it works
 
 ```
-AI agent (Claude, Cursor, Windsurf, Cline, ...)
+AI agents (Claude Code, Cursor, ...)        Claude Desktop
+    │ Streamable HTTP                            │ stdio
+    │ 127.0.0.1:8765/mcp                         ▼
+    │                                     catia-mcp proxy
+    ▼                                            │ HTTP
+catia-mcp serve (background service) ◄───────────┘
     │
-    │ stdio (MCP JSON-RPC)
     ▼
 catia_mcp/server.py (MCP Server)
     │
@@ -367,21 +390,35 @@ catia_mcp/tools/*.py (Tool modules)
 CATIA V5 Application  |  CATIA 3DEXPERIENCE (native app)
 ```
 
-1. The MCP client sends tool calls over stdio
+1. The MCP client sends tool calls to the background service (HTTP, or stdio
+   through the proxy; or stdio straight to a client-launched server)
 2. The server routes each call to the appropriate tool module
 3. Each tool module asks the platform layer for the active Part, body,
    selection or service, then drives CATIA via COM on one serialized
    STA worker thread
-4. Results (JSON, text) are returned to the agent
+4. Results (structured JSON, text, images) are returned to the agent; a call
+   that outlives `CATIA_MCP_CALL_TIMEOUT` returns `CATIA_TIMEOUT`, and new
+   calls fail fast with `CATIA_BUSY` while CATIA is stuck on a dialog
 
 ## Tool Reference
 
-Tools work on both platforms unless marked **V5** or **3DX**.
+Tools work on both platforms unless marked **V5** or **3DX**. Counts per
+section are approximate; `tools/list` is authoritative.
+
+### Session Tools
+| Tool | Description |
+|------|-------------|
+| `catia_status` | Cheap snapshot: connected, platform and release, active document/editor and its kind, in-work object, selection count, windows. Never fails |
+| `catia_get_selection` | What the user has selected in CATIA (names, types), so you can say "fillet the edge I selected" |
+| `catia_undo` | Undo the last CATIA operation(s) (`steps`); not verified, check with a screenshot or a read tool |
+| `catia_redo` | Redo undone operation(s) |
+| `catia_api_search` | Search the installation's own automation reference (`DSYAutomation.chm` / `V5Automation.chm`, decompiled once and cached) |
+| `catia_api_doc` | Read one page of that reference (from a `catia_api_search` hit) |
 
 ### Document Tools (10)
 | Tool | Description |
 |------|-------------|
-| `catia_connect` | Connect to CATIA (platform detected) |
+| `catia_connect` | Connect to CATIA (platform detected); optional, every tool attaches by itself |
 | `catia_disconnect` | Disconnect from CATIA |
 | `catia_new_part` | New Part (V5 CATPart; 3DX 3D Part, falling back to 3D Shape) |
 | `catia_new_product` | New Product (V5 CATProduct; 3DX Physical Product, licence permitting) |
@@ -509,8 +546,8 @@ Tools work on both platforms unless marked **V5** or **3DX**.
 | Tool | Description |
 |------|-------------|
 | `catia_export` | Export to STEP/IGES/STL/3DXML/VRML (**V5**; 3DX only where a document with ExportData exists) |
-| `catia_screenshot` | Capture 3D view to image |
-| `catia_set_view` | Set view orientation |
+| `catia_screenshot` | Capture the 3D view and **return it as an image** to the agent; optional `view` preset, `fit`, `max_size` (downscaling needs the `images` extra / Pillow), `file_path` |
+| `catia_set_view` | Orient the view (Z-up): front, back, left, right, top, bottom, isometric, 8 corner isometrics `iso_<front\|back>_<left\|right>_<top\|bottom>`, or an explicit `sight`/`up` vector |
 | `catia_fit_all` | Fit all in view |
 
 ### Drafting Tools (12) — experimental
@@ -543,11 +580,15 @@ Tools work on both platforms unless marked **V5** or **3DX**.
 |------|-------------|
 | `catia_diagnose` | Report platform, CATIA version/release/SP and probe which automation APIs (and on 3DX, PLM services) this installation exposes. Run it first when tools fail with UNSUPPORTED_CAPABILITY, and paste its output in compatibility reports |
 
-### API Discovery (2)
+### Scripting and API Discovery (3)
 | Tool | Description |
 |------|-------------|
+| `catia_run_python` | Run Python in the server against the live COM objects (`catia`, `part()`, `body()`, `document()`, `editor()`, `product()`, `selection()`, a persistent `session` dict); returns printed output and `result`. The escape hatch for anything no tool covers |
 | `catia_inspect_api` | Read-only: list members, parameters and enum values of a live object (e.g. `part.ShapeFactory`, `editor.GetService("MeasurableService")`) |
-| `catia_run_script` | Run VBScript inside CATIA; disabled unless the server runs with `--allow-scripts` |
+| `catia_run_script` | Run VBScript inside CATIA |
+
+The script tools are on for stdio and loopback, off when the server listens
+on the network unless started with `--allow-scripts`.
 
 ## Troubleshooting
 
@@ -560,14 +601,35 @@ and `recovery`. The text content contains the same JSON. Clients should inspect
 `isError` and the error code rather than matching a plain-text error phrase.
 Codes include `INVALID_ARGUMENT`, `NO_ACTIVE_DOCUMENT`, `WRONG_DOCUMENT_TYPE`,
 `OBJECT_NOT_FOUND`, `AMBIGUOUS_TARGET`, `UNSUPPORTED_CAPABILITY`,
-`PERMISSION_DENIED` and `COM_ERROR`; `effects.modified=false` means the
-failure was detected before CATIA was touched.
+`PERMISSION_DENIED`, `FEATURE_NO_EFFECT`, `SCRIPT_ERROR`, `CATIA_NOT_RUNNING`,
+`CATIA_BUSY`, `CATIA_TIMEOUT` and `COM_ERROR`; `effects.modified=false` means
+the failure was detected before CATIA was touched.
 
 An ordinary exception, including `ValueError`, does not block the next call.
 Cancelling a request does not cancel its COM operation: the STA worker finishes
 that operation before running queued calls. Cancellation does not prove rollback.
-A modal dialog can still block the worker; resolve it in CATIA before continuing.
 See [runtime behavior and recovery](docs/server-runtime.md).
+
+### `CATIA_NOT_RUNNING`
+CATIA is not started, not logged in (3DEXPERIENCE), or closed during the
+call. Start it and retry; the server reattaches by itself. To let a call
+launch CATIA V5, set `CATIA_MCP_LAUNCH=1`.
+
+### `CATIA_BUSY` / `CATIA_TIMEOUT`
+CATIA is stuck in an earlier call, almost always on a modal dialog (licence
+refusal, update error, "save changes?"). `CATIA_TIMEOUT` means a call ran
+longer than `CATIA_MCP_CALL_TIMEOUT` (600 s); it may still finish inside
+CATIA, so inspect the model before repeating a write. `CATIA_BUSY` means a
+new call was refused because the worker has been stuck longer than
+`CATIA_MCP_BUSY_GRACE` (30 s). Both messages name the open CATIA dialogs when
+found. Close the dialog in CATIA, then retry; `catia-mcp status` shows the
+stuck call.
+
+### The background service is not reachable
+Run `catia-mcp status`. If it is not running: `catia-mcp start`, then read
+`%LOCALAPPDATA%\catia-mcp\catia_mcp.log`. Port conflicts, the Claude
+Desktop config location and PATH problems are covered in
+[docs/background-service.md](docs/background-service.md#troubleshooting).
 
 ### "AttributeError" on methods that should exist (AddNewPad, etc.)
 A stale pywin32 COM cache is the most common cause, confirmed in the field:
@@ -576,18 +638,19 @@ cache and restart the server:
 ```
 %LOCALAPPDATA%\Temp\gen_py\        (or %TEMP%\gen_py\)
 ```
-Close CATIA and the MCP server first, delete the whole `gen_py` folder, then
+Close CATIA and stop the server (`catia-mcp stop`) first, delete the whole `gen_py` folder, then
 restart. Run `catia_diagnose` to verify which APIs resolve afterwards.
 
 ### "pywin32 is not installed"
+The installer brings pywin32. For a manual install:
 ```bash
-pip install pywin32
+pip install "pywin32>=311"
 ```
 This server requires Windows to drive CATIA. Agents on macOS or Linux connect
 to it remotely (see Remote use); the offline test suite runs anywhere.
 
 ### "Failed to connect to CATIA"
-1. Make sure CATIA is running (3DEXPERIENCE: started from the launcher and logged in)
+1. Make sure CATIA is running (3DEXPERIENCE: started from the launcher and logged in); the server no longer launches CATIA unless `CATIA_MCP_LAUNCH=1`
 2. CATIA V5: register CATIA as COM server: navigate to `C:\Program Files\Dassault Systemes\B<version>\<os>\code\bin\` and run `cnext.exe /regserver`
 3. With both V5 and 3DEXPERIENCE installed, `CATIA.Application` points to whichever registered last; start only the one you want, or re-register it
 4. Check that no modal dialog is blocking CATIA
@@ -611,8 +674,9 @@ This project is open-source. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelin
 
 - **Drafting** extras: frames and title-block generators, BOM automation
 - **pycatia backend** as alternative to raw win32com
-- **3DEXPERIENCE live reports**: `scripts/live_smoke_test.py` results and
-  `catia_diagnose` output from your release
+- **3DEXPERIENCE live reports**: `scripts/live_smoke_test.py` results (add
+  `--url http://127.0.0.1:8765/mcp` to test through the background service)
+  and `catia_diagnose` output from your release
 
 ## Services and support
 

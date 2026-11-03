@@ -25,6 +25,7 @@ import os
 from typing import Any
 
 from catia_mcp.automation import get_member, iter_items, name_exists, resolves, safe_get
+from catia_mcp.com_thread import BUSY_HRESULTS, hresult
 from catia_mcp.errors import (
     CATIANotRunning,
     InvalidArgument,
@@ -87,6 +88,9 @@ class CATIAConnection:
             launch = os.environ.get("CATIA_MCP_LAUNCH", "").strip().lower() in {"1", "true", "yes", "on"}
         self.launch = launch
         self._initialized_com = False
+        # Incremented on every attach and drop; cached proxies from an older
+        # generation belong to a CATIA process that may no longer exist.
+        self.generation = 0
         self._forced_platform = normalize_platform(
             platform if platform is not None else os.environ.get("CATIA_MCP_PLATFORM")
         )
@@ -105,10 +109,22 @@ class CATIAConnection:
             # Try accessing a property to verify the connection is alive
             _ = self.app.Caption
             return True
-        except Exception:
-            self.app = None
-            self.platform = None
+        except Exception as error:
+            if hresult(error) in BUSY_HRESULTS:
+                # CATIA refused the probe because it is busy (the message
+                # filter already retried): it is alive, keep the proxy.
+                return True
+            self.drop()
             return False
+
+    def drop(self) -> None:
+        """Forget the CATIA proxy (CATIA exited or the user disconnected).
+        Bumping the generation makes the server reset every module's
+        cached COM objects before the next call."""
+        self.app = None
+        self.platform = None
+        self._active_bodies.clear()
+        self.generation += 1
 
     @property
     def is_3dx(self) -> bool:
@@ -142,6 +158,8 @@ class CATIAConnection:
         # Phase 1: Try to attach to a running CATIA instance
         try:
             self.app = win32com.client.GetActiveObject(self.CATIA_PROGID)
+            self.generation += 1
+            self._active_bodies.clear()
             self.platform = self._detect_platform()
             version = self._get_version()
             logger.info("Connected to running %s instance (%s)", self.platform_label, version)
@@ -161,6 +179,8 @@ class CATIAConnection:
         # Phase 2: Launch a new CATIA instance
         try:
             self.app = win32com.client.Dispatch(self.CATIA_PROGID)
+            self.generation += 1
+            self._active_bodies.clear()
             self.app.Visible = True
             self.platform = self._detect_platform()
             version = self._get_version()
@@ -184,26 +204,16 @@ class CATIAConnection:
             ) from e
 
     def disconnect(self) -> str:
-        """Disconnect from CATIA (does not close CATIA)."""
-        if self.app is not None:
-            self.app = None
-        self.platform = None
-        if self._initialized_com:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
-            self._initialized_com = False
+        """Disconnect from CATIA (does not close CATIA). The worker's COM
+        apartment stays initialised: tool modules may still hold proxies,
+        and releasing them in an uninitialised apartment is unsafe."""
+        self.drop()
         return "Disconnected from CATIA"
 
     @staticmethod
     def lost(error: BaseException) -> bool:
         """True when a COM error means CATIA itself went away."""
-        hresult = getattr(error, "hresult", None)
-        if hresult is None and getattr(error, "args", None):
-            first = error.args[0]
-            hresult = first if isinstance(first, int) else None
-        return hresult in _LOST_HRESULTS
+        return hresult(error) in _LOST_HRESULTS
 
     def ensure_connected(self) -> None:
         """Ensure we have an active CATIA connection, connecting if needed."""

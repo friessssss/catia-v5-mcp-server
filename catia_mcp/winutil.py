@@ -29,8 +29,8 @@ def catia_dialog_titles() -> list[str]:
                     name = win32process.GetModuleFileNameEx(handle, 0).rsplit("\\", 1)[-1]
                 finally:
                     win32api.CloseHandle(handle)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:  # noqa: BLE001 -- protected/exited process: not CATIA's
+                name = ""
             exe_by_pid[pid] = name.lower()
         return exe_by_pid[pid]
 

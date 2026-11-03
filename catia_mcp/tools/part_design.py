@@ -78,6 +78,20 @@ class PartDesignTools:
     def __init__(self, connection: CATIAConnection) -> None:
         self.conn = connection
         self.measure = Measurer(connection)
+        # Name of a sketch the current call closed automatically (see
+        # _close_open_sketch); reported with the result, then cleared.
+        self._auto_closed_sketch: str | None = None
+
+    def reset_session_state(self) -> None:
+        """Drop every cached COM proxy after a CATIA reconnect.
+
+        The Measurer caches the measurable-type enum and the codes that
+        worked on the previous session; the open-sketch handle shared with
+        the sketcher points into the old process.
+        """
+        self.measure = Measurer(self.conn)
+        self._auto_closed_sketch = None
+        self.conn.open_sketch = None
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
         return [
@@ -85,7 +99,10 @@ class PartDesignTools:
                 "name": "catia_pad",
                 "description": (
                     "Create a Pad (extrusion) from the last sketch. "
-                    "Extrudes a 2D profile into a 3D solid along the normal to the sketch plane."
+                    "Extrudes a 2D profile into a 3D solid along the normal to the sketch plane. "
+                    "The added volume is measured and reported; a pad that adds nothing "
+                    "fails with FEATURE_NO_EFFECT (the pad stays in the tree). A sketch "
+                    "still open in the sketcher is closed first and used as the profile."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -197,7 +214,9 @@ class PartDesignTools:
                 "name": "catia_fillet",
                 "description": (
                     "Add a fillet (rounded edge) to one or more edges of the current solid. "
-                    "Specify the radius and the edge names or feature to fillet."
+                    "Specify the radius and the edge names or feature to fillet. A fillet "
+                    "CATIA cannot compute fails with FEATURE_UPDATE_FAILED and is removed "
+                    "from the tree."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -220,7 +239,11 @@ class PartDesignTools:
             },
             {
                 "name": "catia_chamfer",
-                "description": "Add a chamfer (beveled edge) to an edge of the current solid.",
+                "description": (
+                    "Add a chamfer (beveled edge) to an edge of the current solid. A chamfer "
+                    "CATIA cannot compute fails with FEATURE_UPDATE_FAILED and is removed "
+                    "from the tree."
+                ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -702,6 +725,76 @@ class PartDesignTools:
         ]
 
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        self._auto_closed_sketch = None
+        try:
+            result = self._dispatch(tool_name, arguments)
+        except CATIAToolError as error:
+            note = self._auto_close_note()
+            if note:
+                # The sketch was closed before the failure: CATIA changed.
+                error.args = (f"{error} {note}",)
+                if error.modified is False:
+                    error.modified = None
+            raise
+        note = self._auto_close_note()
+        return f"{result} {note}" if note else result
+
+    def _auto_close_note(self) -> str:
+        name, self._auto_closed_sketch = self._auto_closed_sketch, None
+        if not name:
+            return ""
+        return (
+            f"Note: sketch '{name}' was still open in the sketcher; it was closed "
+            "automatically before building the feature (call catia_close_sketch "
+            "after drawing to avoid this)."
+        )
+
+    def _close_open_sketch(self) -> Any | None:
+        """Close the sketch the sketcher left in edition, if any.
+
+        A solid feature built while a sketch is still in edition can use an
+        unclosed profile. The sketcher records its open sketch on the shared
+        connection (``connection.open_sketch``); close it the way
+        catia_close_sketch does (CloseEdition, then UpdateObject) and return
+        it so a call without ``sketch_name`` builds on the sketch that was
+        just drawn. Needs live validation: closing a sketch from Part Design
+        tools rather than catia_close_sketch is not field-proven.
+        """
+        sketch = getattr(self.conn, "open_sketch", None)
+        if sketch is None:
+            return None
+        self.conn.open_sketch = None
+        try:
+            name = str(sketch.Name)
+        except Exception:
+            name = "sketch"
+        try:
+            sketch.CloseEdition()
+        except Exception as e:
+            # Still open in CATIA: keep publishing it, or the sketcher would
+            # report "already closed" and refuse to close it on the retry.
+            self.conn.open_sketch = sketch
+            raise CATIAToolError(
+                f"Sketch '{name}' was still open in the sketcher and could not be closed "
+                f"automatically ({e}). Close it with catia_close_sketch, then retry.",
+                modified=None,
+            ) from e
+        try:
+            self.conn.get_active_part().UpdateObject(sketch)
+        except Exception:
+            pass
+        self._auto_closed_sketch = name
+        return sketch
+
+    def _profile_sketch(self, sketch_name: str | None) -> Any:
+        """The sketch a profile-based feature builds on: the named one, else
+        the sketch just closed automatically, else the body's last sketch."""
+        closed = self._close_open_sketch()
+        if closed is not None and not sketch_name:
+            return closed
+        return self._get_last_sketch(sketch_name)
+
+    def _dispatch(self, tool_name: str, arguments: dict[str, Any]) -> str:
         match tool_name:
             case "catia_pad":
                 return self._pad(arguments)
@@ -762,7 +855,6 @@ class PartDesignTools:
 
     def _get_last_sketch(self, sketch_name: str | None = None) -> Any:
         """Get a sketch by name or the last sketch in the body."""
-        part = self.conn.get_active_part()
         body = self.conn.get_active_part_body()
         sketches = body.Sketches
 
@@ -771,14 +863,14 @@ class PartDesignTools:
                 return sketches.Item(sketch_name)
             except Exception:
                 names = ", ".join(str(sketches.Item(i).Name) for i in range(1, sketches.Count + 1))
-                raise RuntimeError(
+                raise ObjectNotFound(
                     f"No sketch named '{sketch_name}' in the active body. "
                     f"Available: {names or 'none'}."
-                )
+                ) from None
 
         # Get the last sketch
         if sketches.Count == 0:
-            raise RuntimeError("No sketches found in the active body. Create a sketch first.")
+            raise ObjectNotFound("No sketches found in the active body. Create a sketch first.")
         return sketches.Item(sketches.Count)
 
     def _get_last_shape(self, feature_name: str | None = None) -> Any:
@@ -791,46 +883,104 @@ class PartDesignTools:
                 return shapes.Item(feature_name)
             except Exception:
                 names = ", ".join(str(shapes.Item(i).Name) for i in range(1, shapes.Count + 1))
-                raise RuntimeError(
+                raise ObjectNotFound(
                     f"No feature named '{feature_name}' in the active body. "
                     f"Available: {names or 'none'}."
-                )
+                ) from None
 
         if shapes.Count == 0:
-            raise RuntimeError("No features found in the active body.")
+            raise ObjectNotFound("No features found in the active body.")
         return shapes.Item(shapes.Count)
 
     def _pad(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
+        height = args["height"]
+        direction = args.get("direction", "normal")
+        symmetric = bool(args.get("symmetric", False))
+        if not height > 0:
+            raise InvalidArgument(
+                "height must be positive (mm); use direction='reverse' to extrude "
+                "the other way."
+            )
         part = self.conn.get_active_part()
         body = self.conn.get_active_part_body()
         sf = part.ShapeFactory
 
-        sketch = self._get_last_sketch(args.get("sketch_name"))
+        sketch = self._profile_sketch(args.get("sketch_name"))
         # V5-6R2020: solid features fail with E_FAIL unless the sketch's
         # owning BODY is the in-work object (fresh documents start on a
         # Geometrical Set).
         _force_solid_inwork(part, sketch)
-        height = args["height"]
-        direction = args.get("direction", "normal")
-        symmetric = args.get("symmetric", False)
+        before = self._volume_before_feature(part, body)
 
         pad = sf.AddNewPad(sketch, height)
 
-        if symmetric:
-            pad.IsSymmetric = True
+        # Direct PUTs can fail on factory-returned objects under dynamic
+        # dispatch (B30 evidence, see _set_prop); a pad whose extent did not
+        # take would silently be one-sided in the wrong place.
+        if symmetric or direction == "both":
+            prop, value, wanted = "IsSymmetric", True, "symmetric extent"
         elif direction == "reverse":
-            pad.DirectionOrientation = 1  # catReverse
-        elif direction == "both":
-            pad.IsSymmetric = True
+            prop, value, wanted = "DirectionOrientation", 1, "reversed direction"  # catReverse
+        else:
+            prop = None
+        if prop and not _set_prop(pad, prop, value):
+            raise CATIAToolError(
+                f"Pad '{pad.Name}' was created but CATIA rejected the {wanted} ({prop}), "
+                "so it extrudes one-sided along the sketch normal. It remains in the "
+                "tree: delete it with catia_delete_feature, then retry or set the "
+                "extent in CATIA.",
+                code="WRONG_GEOMETRY_EFFECT",
+                modified=None,
+            )
 
-        part.UpdateObject(pad)
+        self._safe_update(part, pad)
         self.conn.refresh_display()
-        return f"Pad created: {height} mm ({direction}). Feature: '{pad.Name}'"
+
+        extent = f"{height} mm ({'symmetric' if symmetric else direction})"
+        after = self._body_volume_mm3(part, body)
+        if before is None or after is None:
+            return (
+                f"Pad '{pad.Name}' created: {extent} (volume verification "
+                "unavailable on this installation)."
+            )
+        added = after - before
+        # Re-measuring an unchanged solid can drift by rounding noise; a pad
+        # buried in existing material must not pass as "Added 0.0 mm3".
+        if added <= max(self._PAD_NO_EFFECT_MM3, self._PAD_NO_EFFECT_FRACTION * before):
+            raise CATIAToolError(
+                f"Pad '{pad.Name}' was created in the tree but added no material "
+                f"(volume {before:.1f} -> {after:.1f} mm3); check that the extrusion "
+                "does not lie entirely inside existing material. Delete it with "
+                "catia_delete_feature.",
+                code="FEATURE_NO_EFFECT",
+                modified=None,
+            )
+        return (
+            f"Pad '{pad.Name}' created: {extent}. "
+            f"Added {added:.1f} mm3 ({before:.1f} -> {after:.1f})."
+        )
+
+    # A pad adding no more than this (absolute mm3, or fraction of the body
+    # volume before it) had no effect: above re-measurement noise, below any
+    # real extrusion. Not field-calibrated (needs live validation).
+    _PAD_NO_EFFECT_MM3 = 1e-3
+    _PAD_NO_EFFECT_FRACTION = 1e-7
 
     def _body_volume_mm3(self, part: Any, body: Any) -> float | None:
         """Measure the body's solid volume in mm3, or None if unavailable."""
         return self.measure.body_volume_mm3(part, body)
+
+    def _volume_before_feature(self, part: Any, body: Any) -> float | None:
+        """Body volume before an additive feature. A body without solid
+        features holds no material (0 mm3) even where measuring an empty
+        body fails, so the first pad of a body is verified too."""
+        try:
+            if body.Shapes.Count == 0:
+                return 0.0
+        except Exception:
+            pass
+        return self._body_volume_mm3(part, body)
 
     def _pocket(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
@@ -838,7 +988,7 @@ class PartDesignTools:
         body = self.conn.get_active_part_body()
         sf = part.ShapeFactory
 
-        sketch = self._get_last_sketch(args.get("sketch_name"))
+        sketch = self._profile_sketch(args.get("sketch_name"))
         # V5-6R2020: see _pad - the sketch's owning body must be in-work.
         _force_solid_inwork(part, sketch)
         depth = args["depth"]
@@ -854,10 +1004,12 @@ class PartDesignTools:
             # flip the cut side. Set through the parameter-object fallback:
             # direct PUTs can fail on factory-returned objects.
             if not _set_prop(pocket, "IsSymmetric", True):
-                raise RuntimeError(
+                raise CATIAToolError(
                     f"Pocket '{pocket.Name}' was created but CATIA rejected the symmetric "
                     "extent, so it is one-sided. Delete it with catia_delete_feature or "
-                    "retry without 'symmetric'."
+                    "retry without 'symmetric'.",
+                    code="WRONG_GEOMETRY_EFFECT",
+                    modified=None,
                 )
         else:
             # A pocket cuts on one side of the profile's support plane only,
@@ -917,14 +1069,19 @@ class PartDesignTools:
             "(volume verification unavailable on this installation)."
         )
 
+    @staticmethod
+    def _check_revolution_angle(angle: Any) -> None:
+        if not 0 < angle <= 360:
+            raise InvalidArgument("angle must be in (0, 360] degrees.")
+
     def _shaft(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
+        angle = args.get("angle", 360)
+        self._check_revolution_angle(angle)
         part = self.conn.get_active_part()
-        body = self.conn.get_active_part_body()
         sf = part.ShapeFactory
 
-        sketch = self._get_last_sketch(args.get("sketch_name"))
-        angle = args.get("angle", 360)
+        sketch = self._profile_sketch(args.get("sketch_name"))
 
         # V5-6R2020: see _pad - the sketch's owning body must be in-work.
         _force_solid_inwork(part, sketch)
@@ -938,26 +1095,25 @@ class PartDesignTools:
         vdir = abs_axis.GetItem("VDirection")
         shaft.RevoluteAxis = part.CreateReferenceFromObject(vdir)
         if not _set_prop(shaft, "FirstAngle", angle):
-            raise RuntimeError(
+            raise CATIAToolError(
                 f"Shaft '{shaft.Name}' was created but its angle could not be set to "
-                f"{angle} degrees. Delete it with catia_delete_feature before retrying."
+                f"{angle} degrees. Delete it with catia_delete_feature before retrying.",
+                code="WRONG_GEOMETRY_EFFECT",
+                modified=None,
             )
 
-        try:
-            part.UpdateObject(shaft)
-        except Exception:
-            part.Update()
+        self._safe_update(part, shaft, full_update_fallback=True)
         self.conn.refresh_display()
         return f"Shaft (revolution) created: {angle}°. Feature: '{shaft.Name}'"
 
     def _groove(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
+        angle = args.get("angle", 360)
+        self._check_revolution_angle(angle)
         part = self.conn.get_active_part()
-        body = self.conn.get_active_part_body()
         sf = part.ShapeFactory
 
-        sketch = self._get_last_sketch(args.get("sketch_name"))
-        angle = args.get("angle", 360)
+        sketch = self._profile_sketch(args.get("sketch_name"))
 
         # V5-6R2020: see _pad - the sketch's owning body must be in-work.
         _force_solid_inwork(part, sketch)
@@ -968,35 +1124,73 @@ class PartDesignTools:
         vdir = abs_axis.GetItem("VDirection")
         groove.RevoluteAxis = part.CreateReferenceFromObject(vdir)
         if not _set_prop(groove, "FirstAngle", angle):
-            raise RuntimeError(
+            raise CATIAToolError(
                 f"Groove '{groove.Name}' was created but its angle could not be set to "
-                f"{angle} degrees. Delete it with catia_delete_feature before retrying."
+                f"{angle} degrees. Delete it with catia_delete_feature before retrying.",
+                code="WRONG_GEOMETRY_EFFECT",
+                modified=None,
             )
 
-        try:
-            part.UpdateObject(groove)
-        except Exception:
-            part.Update()
+        self._safe_update(part, groove, full_update_fallback=True)
         self.conn.refresh_display()
         return f"Groove (revolution cut) created: {angle}°. Feature: '{groove.Name}'"
 
-    def _safe_update(self, part: Any, feature: Any) -> None:
+    def _safe_update(self, part: Any, feature: Any, *, full_update_fallback: bool = False) -> None:
         """Update a feature; if CATIA rejects it, remove the broken feature
-        from the tree so a failed attempt does not poison later features."""
+        from the tree so a failed attempt does not poison later features.
+
+        ``full_update_fallback`` keeps the V5-6R2020 (B30) recipe of Shaft,
+        Groove and Hole: when UpdateObject raises, a full ``part.Update()``
+        is tried before the feature is declared broken.
+
+        Raises CATIAToolError(FEATURE_UPDATE_FAILED) saying whether the
+        feature was removed or still needs catia_delete_feature.
+        """
         try:
             part.UpdateObject(feature)
+            return
         except Exception as e:
+            error = e
+        if full_update_fallback:
             try:
-                selection = self.conn.hso
-                selection.Clear()
-                selection.Add(feature)
-                selection.Delete()
-            except Exception:
-                pass
-            raise RuntimeError(
-                f"CATIA rejected the feature (update failed) and it was "
-                f"removed from the tree: {e}"
-            ) from e
+                part.Update()
+                return
+            except Exception as e:
+                error = e
+        try:
+            name = str(feature.Name)
+        except Exception:
+            name = "the feature"
+        selection = None
+        try:
+            selection = self.conn.hso
+            selection.Clear()
+            selection.Add(feature)
+            selection.Delete()
+            removed = True
+        except Exception:
+            removed = False
+        finally:
+            if selection is not None:
+                try:
+                    selection.Clear()
+                except Exception:
+                    pass
+        if removed:
+            outcome = (
+                "it was removed from the tree, so no broken feature is left behind. "
+                "Check the inputs (edge/face choice, sizes, profile) and retry."
+            )
+        else:
+            outcome = (
+                "it could NOT be removed automatically and remains in the tree in "
+                f"error: delete '{name}' with catia_delete_feature before continuing."
+            )
+        raise CATIAToolError(
+            f"CATIA rejected '{name}' (update failed: {error}); {outcome}",
+            code="FEATURE_UPDATE_FAILED",
+            modified=None,
+        ) from error
 
     def _topo_reference(self, kind: str, index: int) -> Any:
         """Resolve Face.N / Edge.N on the active body's final shape to a
@@ -1009,11 +1203,12 @@ class PartDesignTools:
 
     def _fillet(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
+        radius = args["radius"]
+        if not radius > 0:
+            raise InvalidArgument("radius must be positive (mm).")
         part = self.conn.get_active_part()
-        body = self.conn.get_active_part_body()
         sf = part.ShapeFactory
 
-        radius = args["radius"]
         edge_name = args.get("edge_name")
         if edge_name:
             target = self._topo_reference("Edge", self._topo_index(edge_name, "Edge"))
@@ -1030,18 +1225,23 @@ class PartDesignTools:
             radius,
         )
 
-        part.UpdateObject(fillet)
+        # A radius larger than the adjacent faces allow fails on update; the
+        # broken fillet is removed instead of poisoning every later feature.
+        self._safe_update(part, fillet)
         self.conn.refresh_display()
         return f"Fillet created: R{radius} mm on {scope}. Feature: '{fillet.Name}'"
 
     def _chamfer(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
-        part = self.conn.get_active_part()
-        body = self.conn.get_active_part_body()
-        sf = part.ShapeFactory
-
         length = args["length"]
         angle = args.get("angle", 45)
+        if not length > 0:
+            raise InvalidArgument("length must be positive (mm).")
+        if not 0 < angle < 90:
+            raise InvalidArgument("angle must be strictly between 0 and 90 degrees.")
+        part = self.conn.get_active_part()
+        sf = part.ShapeFactory
+
         edge_name = args.get("edge_name")
         if edge_name:
             target = self._topo_reference("Edge", self._topo_index(edge_name, "Edge"))
@@ -1061,7 +1261,7 @@ class PartDesignTools:
             angle,
         )
 
-        part.UpdateObject(chamfer)
+        self._safe_update(part, chamfer)
         self.conn.refresh_display()
         return f"Chamfer created: {length} mm at {angle} deg on {scope}. Feature: '{chamfer.Name}'"
 
@@ -1076,11 +1276,18 @@ class PartDesignTools:
         depth = args["depth"]
         if diameter <= 0 or depth <= 0:
             raise InvalidArgument("diameter and depth must be positive (mm).")
+        hole_type = args.get("type", "simple")
+        # CatHoleType: 0 simple, 1 tapered, 2 counterbored, 3 countersunk.
+        type_map = {"simple": 0, "tapered": 1, "counterbored": 2, "countersunk": 3}
+        if hole_type not in type_map:
+            raise InvalidArgument(
+                f"Unknown hole type '{hole_type}'. Use one of: {', '.join(type_map)}."
+            )
         part = self.conn.get_active_part()
         body = self.conn.get_active_part_body()
         sf = part.ShapeFactory
 
-        sketch = self._get_last_sketch(args.get("sketch_name"))
+        sketch = self._profile_sketch(args.get("sketch_name"))
         before = self._body_volume_mm3(part, body)
 
         # V5-6R2020: see _pad - the sketch's owning body must be in-work.
@@ -1105,25 +1312,35 @@ class PartDesignTools:
             )
         hole.BottomType = 0  # catFlatBottom
 
-        hole_type = args.get("type", "simple")
-        type_map = {"simple": 0, "tapered": 1, "counterbored": 2, "countersunk": 3}
         type_note = ""
-        if hole_type in type_map and hole_type != "simple":
-            try:
-                hole.Type = type_map[hole_type]
-                type_note = (
-                    f" Type: {hole_type} (head dimensions keep CATIA "
-                    "defaults; adjust in the tree if needed)."
+        if hole_type != "simple":
+            wanted = type_map[hole_type]
+            applied = _set_prop(hole, "Type", wanted)
+            if applied:
+                # Read back: a PUT CATIA accepts but coerces is still a
+                # different hole. Unreadable (parameter object): trust the PUT.
+                try:
+                    applied = int(hole.Type) == wanted
+                except Exception:
+                    pass
+            if not applied:
+                # Previously reported as success with a silent simple hole.
+                raise CATIAToolError(
+                    f"Hole '{hole.Name}' was created as a simple hole: CATIA rejected the "
+                    f"requested type '{hole_type}'. It remains in the tree; delete it with "
+                    "catia_delete_feature, then retry with type 'simple' or set the type "
+                    "in CATIA.",
+                    code="WRONG_GEOMETRY_EFFECT",
+                    modified=None,
                 )
-            except Exception:
-                type_note = f" Type '{hole_type}' not applied (API rejected it); simple hole created."
+            type_note = (
+                f" Type: {hole_type} (head dimensions keep CATIA "
+                "defaults; adjust in the tree if needed)."
+            )
 
-        try:
-            part.UpdateObject(hole)
-        except Exception:
-            part.Update()
-
-        part.UpdateObject(hole)
+        # One update (it used to run twice); the full part.Update() fallback
+        # is the V5-6R2020 recipe, and a hole CATIA still rejects is removed.
+        self._safe_update(part, hole, full_update_fallback=True)
         threshold = self._HOLE_NO_EFFECT_FRACTION * math.pi * diameter**2 * depth / 4.0
         after = self._body_volume_mm3(part, body)
         reversed_note = ""
@@ -1149,9 +1366,11 @@ class PartDesignTools:
             # breaks the rebuild, so apply it AFTER the first update. B30
             # type libraries: CatHoleThreadingMode threaded = 0 (1 = smooth).
             if not _set_prop(hole, "ThreadingMode", 0):
-                raise RuntimeError(
+                raise CATIAToolError(
                     f"Hole '{hole.Name}' was created but CATIA rejected the threading "
-                    "mode, so it is smooth. Retry without 'threaded' or thread it in CATIA."
+                    "mode, so it is smooth. Retry without 'threaded' or thread it in CATIA.",
+                    code="WRONG_GEOMETRY_EFFECT",
+                    modified=None,
                 )
             try:
                 part.Update()
@@ -1193,7 +1412,7 @@ class PartDesignTools:
         dir1_edge = args.get("dir1_edge")
         dir2_edge = args.get("dir2_edge")
         if bool(dir1_edge) != bool(dir2_edge):
-            raise ValueError(
+            raise InvalidArgument(
                 "Pass both 'dir1_edge' and 'dir2_edge' ('Edge.N' from "
                 "catia_list_edges, two adjacent edges sharing a corner), "
                 "or neither."
@@ -1309,16 +1528,16 @@ class PartDesignTools:
 
         count = int(args["count"])
         if count < 1:
-            raise ValueError("count must be at least 1")
+            raise InvalidArgument("count must be at least 1")
         angular_spacing = args.get("angular_spacing")
         if angular_spacing is None:
             angular_spacing = 360.0 / count
         axis = (args.get("axis") or "z").lower()
         if axis not in ("x", "y", "z"):
-            raise ValueError("axis must be 'x', 'y' or 'z'")
+            raise InvalidArgument("axis must be 'x', 'y' or 'z'")
         center = args.get("center") or [0.0, 0.0, 0.0]
         if len(center) != 3:
-            raise ValueError("center must be [x, y, z] in mm")
+            raise InvalidArgument("center must be [x, y, z] in mm")
         if self.conn.is_3dx:
             return self._circ_pattern_3dx(args, count, angular_spacing, axis, center)
         # Field-proven precondition: AddNewCircPattern fails with 0x80020009
@@ -1328,7 +1547,7 @@ class PartDesignTools:
         except Exception:
             geosets = 0
         if geosets:
-            raise RuntimeError(
+            raise UnsupportedCapability(
                 "catia_circ_pattern cannot run on a part that contains "
                 "geometrical sets (GSD geometry): CATIA rejects the pattern "
                 "with 0x80020009 in that case. Remove the geometrical sets "
@@ -1424,6 +1643,17 @@ class PartDesignTools:
                 False,                 # radius aligned
             )
             self._safe_update(part, pattern)
+        except CATIAToolError as e:
+            # Keep the typed code (FEATURE_UPDATE_FAILED); the axis line was
+            # created, so the model changed whatever the error said before.
+            e.args = (
+                (
+                    f"{e} The construction axis line '{line.Name}' remains in geometrical "
+                    f"set '{geoset.Name}'; delete it if it is not needed."
+                ),
+            )
+            e.modified = None
+            raise
         except Exception as e:
             raise RuntimeError(
                 f"{e} The construction axis line '{line.Name}' remains in geometrical "
@@ -1449,6 +1679,9 @@ class PartDesignTools:
         part = self.conn.get_active_part()
         body = self.conn.get_active_part_body()
         sf = part.ShapeFactory
+        # Profile and center curve are addressed by name, so a sketch still
+        # open in the sketcher is only closed, never substituted.
+        self._close_open_sketch()
         profile = self._profile_object(part, args["profile"])
         center = self._profile_object(part, args["center_curve"])
         before = self._body_volume_mm3(part, body)
@@ -1639,13 +1872,13 @@ class PartDesignTools:
         feature = self._get_last_shape(args.get("feature_name"))
         count = int(args["count"])
         if count < 1:
-            raise ValueError("count must be at least 1")
+            raise InvalidArgument("count must be at least 1")
         sketch_name = args.get("sketch_name")
         if not sketch_name:
             # Field-proven trap: the last item of body.Sketches is stale right
             # after CloseEdition and resolves to the previous sketch, so the
             # points sketch must be addressed by name.
-            raise ValueError(
+            raise InvalidArgument(
                 "catia_user_pattern requires 'sketch_name': the points sketch "
                 "name reported by catia_close_sketch (e.g. 'Sketch.3')."
             )
@@ -1663,6 +1896,8 @@ class PartDesignTools:
                 "Instead, draw one circle per position in a sketch and cut them with "
                 "catia_pocket, or create one catia_hole per position."
             )
+        # The points sketch must be closed before it can locate instances.
+        self._close_open_sketch()
         sketch = self._get_last_sketch(sketch_name)
 
         before = self._body_volume_mm3(part, body)
@@ -1686,13 +1921,15 @@ class PartDesignTools:
     def _mirror(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
         part = self.conn.get_active_part()
-        body = self.conn.get_active_part_body()
+        # Kept for its check: a deleted/renamed active body is refused
+        # (OBJECT_NOT_FOUND) before anything is created.
+        self.conn.get_active_part_body()
         sf = part.ShapeFactory
 
         plane_key = args["plane"].lower()
         planes = self.conn.get_origin_elements()
         if plane_key not in planes:
-            raise ValueError(f"Unknown plane '{plane_key}'. Use 'xy', 'yz', or 'zx'.")
+            raise InvalidArgument(f"Unknown plane '{plane_key}'. Use 'xy', 'yz', or 'zx'.")
 
         mirror_plane = planes[plane_key]
         ref = part.CreateReferenceFromObject(mirror_plane)
@@ -1712,13 +1949,15 @@ class PartDesignTools:
     def _shell(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
         part = self.conn.get_active_part()
-        body = self.conn.get_active_part_body()
+        # Kept for its check: a deleted/renamed active body is refused
+        # (OBJECT_NOT_FOUND) before anything is created.
+        self.conn.get_active_part_body()
         sf = part.ShapeFactory
 
         thickness = args["thickness"]
         faces = args.get("faces_to_remove") or []
         if not faces:
-            raise ValueError(
+            raise InvalidArgument(
                 "catia_shell requires 'faces_to_remove' with at least one "
                 "indexed face name ('Face.N' from catia_list_faces): "
                 "AddNewShell's first parameter is the face to remove."
@@ -1747,13 +1986,15 @@ class PartDesignTools:
     def _draft(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
         part = self.conn.get_active_part()
-        body = self.conn.get_active_part_body()
+        # Kept for its check: a deleted/renamed active body is refused
+        # (OBJECT_NOT_FOUND) before anything is created.
+        self.conn.get_active_part_body()
         sf = part.ShapeFactory
 
         angle = args["angle"]
         face_name = args.get("face_name")
         if not face_name:
-            raise ValueError(
+            raise InvalidArgument(
                 "catia_draft requires 'face_name' ('Face.N' from "
                 "catia_list_faces): the face to draft."
             )
@@ -1763,7 +2004,7 @@ class PartDesignTools:
         planes = self.conn.get_origin_elements()
         neutral = planes.get(plane_key)
         if not neutral:
-            raise ValueError(f"Unknown pulling direction plane: {plane_key}")
+            raise InvalidArgument(f"Unknown pulling direction plane: {plane_key}")
         neutral_ref = part.CreateReferenceFromObject(neutral)
 
         # Pulling direction = the selected plane's normal.
@@ -1785,13 +2026,15 @@ class PartDesignTools:
     def _thickness(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
         part = self.conn.get_active_part()
-        body = self.conn.get_active_part_body()
+        # Kept for its check: a deleted/renamed active body is refused
+        # (OBJECT_NOT_FOUND) before anything is created.
+        self.conn.get_active_part_body()
         sf = part.ShapeFactory
 
         offset = args["offset"]
         face_name = args.get("face_name")
         if not face_name:
-            raise ValueError(
+            raise InvalidArgument(
                 "catia_thickness requires 'face_name' ('Face.N' from "
                 "catia_list_faces): the face to thicken."
             )
@@ -1820,7 +2063,7 @@ class PartDesignTools:
             if feature is not None:
                 break
         if feature is None:
-            raise RuntimeError(
+            raise ObjectNotFound(
                 f"No feature named '{target}' in any body of the active part. "
                 "Use catia_list_features to see names."
             )
@@ -1857,12 +2100,40 @@ class PartDesignTools:
             features.append({
                 "index": i,
                 "name": shape.Name,
-                "type": shape.Type if hasattr(shape, "Type") else "unknown",
+                "type": self._feature_type(shape),
             })
 
         if not features:
             return "No features in the active body"
         return json.dumps(features, indent=2)
+
+    @staticmethod
+    def _feature_type(shape: Any) -> str:
+        """Feature type for catia_list_features.
+
+        The COM class name from type information first (locale-independent;
+        type_name already resolves Hole on R428, see _is_hole). Live R428 and
+        V5 smoke runs reported 'unknown' for every feature because shapes
+        expose no string ``Type`` property (Hole.Type is the CatHoleType
+        enum). Fallbacks: a string ``Type`` property, then the tree name
+        without its ``.N`` suffix (locale-dependent), then 'unknown'.
+        """
+        name = type_name(shape)
+        if name:
+            return name
+        try:
+            value = shape.Type
+            if isinstance(value, str) and value:
+                return value
+        except Exception:
+            pass
+        try:
+            stem = str(shape.Name).rsplit(".", 1)[0].strip()
+            if stem:
+                return stem
+        except Exception:
+            pass
+        return "unknown"
 
     def _list_faces(self, body_name: str | None = None) -> str:
         self.conn.ensure_connected()
@@ -1873,9 +2144,9 @@ class PartDesignTools:
                 body = bodies.Item(body_name)
             except Exception:
                 names = ", ".join(str(bodies.Item(i).Name) for i in range(1, bodies.Count + 1))
-                raise RuntimeError(
+                raise ObjectNotFound(
                     f"No body named '{body_name}'. Top-level bodies: {names or 'none'}."
-                )
+                ) from None
         else:
             body = self.conn.get_active_part_body()
 
@@ -1902,7 +2173,6 @@ class PartDesignTools:
 
     def _list_edges(self) -> str:
         self.conn.ensure_connected()
-        part = self.conn.get_active_part()
         body = self.conn.get_active_part_body()
 
         # Get edges from the last shape

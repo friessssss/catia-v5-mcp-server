@@ -8,25 +8,50 @@ workstation (Vagon, Shadow, a GPU VM).
 
 ```
 Mac / laptop                      Windows machine (local or cloud)
-AI client  --HTTP + token-->      catia-mcp --http  --COM-->  CATIA V5
+AI client  --HTTP + token-->      catia-mcp serve  --COM-->  CATIA
 ```
 
 ## 1. On the Windows machine
 
-Install the server as usual, then create a token and start it:
+Install the server as usual ([background-service.md](background-service.md)):
 
-```bat
-catia-mcp --new-token
-set CATIA_MCP_TOKEN=<paste the token>
-catia-mcp --http --host 0.0.0.0 --port 8765
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/friessssss/catia-v5-mcp-server/main/scripts/install.ps1 | iex"
 ```
 
-`python -m catia_mcp.server --http ...` works the same if the `catia-mcp`
-command is not on the PATH.
+The installed background service listens on `127.0.0.1:8765` only. Two ways
+to reach it from another machine:
+
+- **SSH tunnel (no token, nothing to change on Windows):** keep the installed
+  service as it is and tunnel to it (section 2). The service still only
+  listens on loopback.
+- **Listen on the network (token required):** stop the loopback service and
+  run one bound to all interfaces with a token:
+
+  ```bat
+  catia-mcp stop
+  catia-mcp --new-token
+  set CATIA_MCP_TOKEN=<paste the token>
+  catia-mcp serve --host 0.0.0.0 --port 8765
+  ```
+
+  This runs in the foreground; keep the window open. The logon autostart
+  still starts the loopback-only service at the next logon; run
+  `catia-mcp install --no-clients` again to go back to it, or
+  `catia-mcp uninstall` to remove the autostart.
+
+`python -m catia_mcp serve ...` works the same if the `catia-mcp` command is
+not on the PATH.
 
 - Without `--host`, the server only listens on `127.0.0.1` (same machine).
 - On any other address it refuses to start without a token of at least
   16 characters. Every request must send `Authorization: Bearer <token>`.
+- The script tools (`catia_run_python`, `catia_run_script`) are **off** on a
+  server listening beyond loopback unless you add `--allow-scripts`: anyone
+  with the token could then run code as you on that machine.
+- `catia-mcp status` does not send the token, so it reports a
+  token-protected service as not running; check it with
+  `curl -H "Authorization: Bearer <token>" http://127.0.0.1:8765/health`.
 - Allow the port in the Windows firewall if Windows asks.
 - Keep CATIA open and visible in that Windows session: the server drives
   the running CATIA, it does not launch a hidden one.
@@ -39,9 +64,10 @@ internet; anyone holding the URL and the token would drive your CATIA.
 - **Recommended: Tailscale** (free for personal use). Install it on both
   machines, sign in with the same account, and use the Windows machine's
   Tailscale name or `100.x.y.z` address. Works the same for a cloud PC.
-- **SSH tunnel**: start the server without `--host` (loopback only) and run
-  `ssh -L 8765:127.0.0.1:8765 user@windows-host` from the Mac. The URL is
-  then `http://127.0.0.1:8765/mcp` on the Mac.
+- **SSH tunnel**: with the installed loopback service (or `catia-mcp serve`
+  without `--host`), run `ssh -L 8765:127.0.0.1:8765 user@windows-host` from
+  the Mac (Windows needs the OpenSSH server feature). The URL is then
+  `http://127.0.0.1:8765/mcp` on the Mac, and no token is needed.
 - **Same office network**: the Windows machine's LAN IP works, with the token.
 
 ## 3. Configure the client (on the Mac)
@@ -51,7 +77,7 @@ Replace `HOST` with the Tailscale name, IP, or `127.0.0.1` for a tunnel.
 **Claude Code**
 
 ```bash
-claude mcp add --transport http catia-v5 http://HOST:8765/mcp \
+claude mcp add --scope user --transport http catia http://HOST:8765/mcp \
   --header "Authorization: Bearer YOUR_TOKEN"
 ```
 
@@ -60,7 +86,7 @@ claude mcp add --transport http catia-v5 http://HOST:8765/mcp \
 ```json
 {
   "mcpServers": {
-    "catia-v5": {
+    "catia": {
       "url": "http://HOST:8765/mcp",
       "headers": { "Authorization": "Bearer YOUR_TOKEN" }
     }
@@ -73,7 +99,7 @@ claude mcp add --transport http catia-v5 http://HOST:8765/mcp \
 ```json
 {
   "servers": {
-    "catia-v5": {
+    "catia": {
       "type": "http",
       "url": "http://HOST:8765/mcp",
       "headers": { "Authorization": "Bearer YOUR_TOKEN" }
@@ -82,13 +108,17 @@ claude mcp add --transport http catia-v5 http://HOST:8765/mcp \
 }
 ```
 
-**Claude Desktop** reads only local (stdio) servers from its config file,
-so it goes through the `mcp-remote` bridge (needs Node.js on the Mac):
+**Claude Desktop** reads only local (stdio) servers from its config file.
+On the CATIA machine itself, `catia-mcp install` configures it with
+`catia-mcp proxy`, a stdio bridge to the local service; that bridge only
+reaches `127.0.0.1` (`--port` picks the port). From another machine, Claude
+Desktop goes through the `mcp-remote` bridge instead (needs Node.js on the
+Mac):
 
 ```json
 {
   "mcpServers": {
-    "catia-v5": {
+    "catia": {
       "command": "npx",
       "args": [
         "mcp-remote", "http://HOST:8765/mcp",
@@ -112,5 +142,6 @@ private network as described above.
   proxy (Caddy, nginx) in front if you need HTTPS.
 - Web chat connectors (claude.ai, ChatGPT) need a public HTTPS URL with
   OAuth, which this transport does not provide; use a desktop or CLI client.
-- Screenshots and exports are written on the Windows machine's disk, at the
-  paths the tools receive.
+- Exports are written on the Windows machine's disk, at the paths the tools
+  receive. `catia_screenshot` also returns the picture itself to the client,
+  so the agent sees it wherever it runs.

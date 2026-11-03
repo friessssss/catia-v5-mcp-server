@@ -26,10 +26,21 @@ There is no global unknown-session latch in this runtime change. It does not
 introduce CAA tools, binaries, dependencies or native delivery-state handling.
 CAA-specific indeterminate writes and recovery belong to the separate adapter.
 
-No modal-dialog detection or COM-call cancellation is implemented. If a CATIA
-dialog blocks a call, the worker and shutdown wait for it. Close the dialog. If
-CATIA cannot recover, terminate CNEXT and restart MCP. This is a documented
-runtime limitation, not a bounded-shutdown guarantee.
+Calls are bounded on the client side. A call still running after
+`CATIA_MCP_CALL_TIMEOUT` seconds (default 600) returns `CATIA_TIMEOUT`
+(`effects.modified` unknown). While the worker stays inside one call for
+longer than `CATIA_MCP_BUSY_GRACE` seconds (default 30), new calls are not
+queued behind it: they fail at once with `CATIA_BUSY` and
+`effects.modified=false`, naming the stuck tool and how long it has run. Both
+messages list the titles of open CATIA dialog windows when the server can find
+them (window enumeration only, no COM call, so it works while CATIA is
+blocked). `/health` and `catia-mcp status` show the busy call too.
+
+There is still no COM-call cancellation: a timed-out call keeps running inside
+CATIA and may yet complete. Close the dialog in CATIA and the worker carries
+on; inspect the model before repeating a write. If CATIA cannot recover, close
+it; the next call returns `CATIA_NOT_RUNNING` and the server reattaches once
+CATIA is back, without a restart.
 
 Install and run the offline regressions:
 
@@ -38,6 +49,9 @@ python -m pip install -e ".[dev]"
 python -m pytest tests test_server.py -q
 ```
 
-Windows CI runs this command on Python 3.10 and 3.12. Local tests use COM doubles
+Windows CI runs this command on Python 3.10, 3.12 and 3.13. Local tests use COM doubles
 for thread ownership, serialization, errors and cancellation; they do not prove
 live CATIA method behavior.
+
+The always-on service, its proxy and its configuration are described in
+[background-service.md](background-service.md).

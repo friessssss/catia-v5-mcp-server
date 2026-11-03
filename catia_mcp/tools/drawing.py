@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, ClassVar
 
 from catia_mcp.automation import call_out_object, iter_items, name_exists, resolves, safe_get
 from catia_mcp.connection import CATIAConnection
@@ -359,8 +359,9 @@ class DraftingTools:
                 "name": "catia_drawing_list_views",
                 "description": (
                     "List the sheets of the active drawing and the views of each sheet "
-                    "(name, position, scale, generative or not), to pick view_name / "
-                    "parent_view values."
+                    "(name, role main/background/user, position, scale, generative or "
+                    "not), to pick view_name / parent_view values. 'main' and "
+                    "'background' are accepted as view_name aliases."
                 ),
                 "inputSchema": {"type": "object", "properties": {}},
             },
@@ -723,6 +724,21 @@ class DraftingTools:
         "diameter": 9,
     }
 
+    # Sheet views 1 and 2 are always the Main and Background views. Their
+    # names differ by platform: V5 "Main View" / "Background View", while the
+    # R428 SP6 smoke run listed them as "View.1" / "View.2"; these aliases
+    # reach them by role on both.
+    _VIEW_ALIASES: ClassVar[dict[str, int]] = {
+        "main": 1,
+        "main view": 1,
+        "background": 2,
+        "background view": 2,
+    }
+
+    @staticmethod
+    def _view_role(index: int) -> str:
+        return {1: "main", 2: "background"}.get(index, "user")
+
     def _find_view(self, view_name: str | None) -> Any:
         drawing = self._find_active_drawing()
         views = self._active_sheet(drawing).Views
@@ -731,8 +747,14 @@ class DraftingTools:
                 v = views.Item(i)
                 if str(v.Name) == view_name:
                     return v
+            alias = self._VIEW_ALIASES.get(" ".join(view_name.lower().split()))
+            if alias is not None and views.Count >= alias:
+                return views.Item(alias)
             names = ", ".join(str(views.Item(i).Name) for i in range(1, views.Count + 1))
-            raise ObjectNotFound(f"No view named '{view_name}'. Views: {names}.")
+            raise ObjectNotFound(
+                f"No view named '{view_name}'. Views: {names}. 'main' and 'background' "
+                "also reach the sheet's Main / Background view."
+            )
         if views.Count < 3:
             raise ObjectNotFound(
                 "The active sheet has no user view yet (only Main/Background). "
@@ -960,8 +982,9 @@ class DraftingTools:
 
     def _find_view_any(self, view_name: str | None) -> Any:
         """Resolve a view for annotations: by name (Main/Background views
-        included), else the last user view, else the Background View so
-        title blocks can be filled on an otherwise empty sheet."""
+        included, also by the aliases 'main' / 'background'), else the last
+        user view, else the Background View so title blocks can be filled on
+        an otherwise empty sheet."""
         if view_name:
             return self._find_view(view_name)
         views = self._active_sheet(self._find_active_drawing()).Views
@@ -1348,7 +1371,11 @@ class DraftingTools:
         for sheet in iter_items(drawing.Sheets):
             views = []
             for i, view in enumerate(iter_items(sheet.Views), start=1):
-                row: dict[str, Any] = {"index": i, "name": str(safe_get(view, "Name", "<unnamed>"))}
+                row: dict[str, Any] = {
+                    "index": i,
+                    "name": str(safe_get(view, "Name", "<unnamed>")),
+                    "role": self._view_role(i),
+                }
                 try:
                     row["x"] = round(float(view.x), 2)
                     row["y"] = round(float(view.y), 2)

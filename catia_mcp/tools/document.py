@@ -10,6 +10,7 @@ Database search and open live in tools/plm.py.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 from catia_mcp.automation import com_name, iter_items, resolves, safe_get
@@ -21,7 +22,15 @@ from catia_mcp.errors import (
     UnsupportedCapability,
     after_mutation,
 )
-from catia_mcp.plm import PLMSession
+from catia_mcp.plm import DEFAULT_PLM_TYPE_ENV, PLMSession, file_alerts_off
+
+def _mtime(path: str) -> int | None:
+    """Modification time of an existing file, else None."""
+    try:
+        return os.stat(path).st_mtime_ns if os.path.isfile(path) else None
+    except OSError:
+        return None
+
 
 def _same(a: Any, b: Any) -> bool:
     """COM identity (pywin32 compares the underlying IUnknown)."""
@@ -49,9 +58,11 @@ class DocumentTools:
             {
                 "name": "catia_connect",
                 "description": (
-                    "Connect to CATIA V5 or CATIA 3DEXPERIENCE (detected automatically). "
-                    "Attaches to a running instance or launches a new one. "
-                    "Must be called before any other CATIA tool."
+                    "Attach to the running CATIA V5 or CATIA 3DEXPERIENCE session "
+                    "(platform detected automatically) and report its version. Optional: "
+                    "every CATIA tool attaches on its own. CATIA is launched only when "
+                    "the server runs with CATIA_MCP_LAUNCH=1; otherwise start CATIA (and "
+                    "log in on 3DEXPERIENCE) first."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -87,7 +98,10 @@ class DocumentTools:
                             "enum": ["auto", "3DPart", "3DShape"],
                             "description": (
                                 "3DEXPERIENCE only. 'auto' (default) tries a 3D Part and "
-                                "falls back to a 3D Shape when the licence refuses it."
+                                "falls back to a 3D Shape when CATIA refuses it (the refusal "
+                                "is remembered for the session, so later 'auto' calls go "
+                                f"straight to 3D Shape). {DEFAULT_PLM_TYPE_ENV}=3DShape on the "
+                                "server skips the 3D Part attempt."
                             ),
                         },
                     },
@@ -254,36 +268,16 @@ class DocumentTools:
         return f"Created new Part document: '{part_name}'{rename_note}"
 
     def _new_part_3dx(self, name: str | None, plm_type: str) -> str:
-        attempts = ["3DPart", "3DShape"] if plm_type == "auto" else [plm_type]
-        errors: list[str] = []
-        created = None
-        for kind in attempts:
-            try:
-                self.plm.create(kind)
-                created = kind
-                break
-            except Exception as e:
-                errors.append(f"{kind}: {e}")
-        if created is None:
-            raise RuntimeError(
-                "3DEXPERIENCE refused to create the part ("
-                + "; ".join(errors)
-                + "). Check that you are logged in, have a collaborative space "
-                "selected, and hold a role allowing creation."
-            )
+        # Refusals raise at once and are cached per connection (plm.py), so
+        # a site without the 3D Part role no longer waits ~55 s per call.
+        created, note = self.plm.create_part(plm_type)
         with after_mutation():
             part = self.conn.get_active_part()
-            note = ""
-            if created == "3DShape" and plm_type == "auto":
-                note = (
-                    " A 3D Part could not be created (" + errors[0] + "), so a 3D Shape was "
-                    "created instead; it has no product node of its own."
-                )
             title = self._apply_title(name, part)
         self.conn.refresh_display()
         return (
             f"Created new {created} '{title}' in the session (not yet saved to the "
-            f"database).{note}"
+            f"database)." + (f" {note}" if note else "")
         )
 
     def _apply_title(self, name: str | None, part: Any) -> str:
@@ -349,6 +343,22 @@ class DocumentTools:
                 "catia_search_database / catia_open_from_database, or import the file "
                 "in the CATIA UI first."
             )
+        # Refuse a missing file before Documents.Open: on a bad path it raises
+        # a bare COM error (or a modal on some releases). CATIA resolves a
+        # relative path against its own working directory, not the server's,
+        # so a relative path is refused too. UNC and drive paths are checked
+        # the same way; os.path.exists is False on a machine that cannot see them.
+        if not os.path.isabs(file_path):
+            raise InvalidArgument(
+                f"file_path must be absolute (got {file_path!r}): CATIA resolves "
+                "relative paths against its own working directory."
+            )
+        if not os.path.isfile(file_path):
+            raise ObjectNotFound(
+                f"File not found: {file_path}. Pass the full path of an existing "
+                ".CATPart / .CATProduct / .CATDrawing visible from the machine running "
+                "the server."
+            )
         docs = self.conn.documents
         doc = docs.Open(file_path)
         return f"Opened document: '{doc.Name}' from {file_path}"
@@ -365,38 +375,61 @@ class DocumentTools:
             self.plm.propagate()
             return f"Saved '{title}' (active editor content) to the 3DEXPERIENCE database."
         doc = self.conn.active_document
+        # DisplayFileAlerts=False: an overwrite / "save in a newer level"
+        # prompt would otherwise block SaveAs/Save, and the worker with it.
+        # With alerts off, SaveAs overwrites an existing file silently.
         if file_path:
-            doc.SaveAs(file_path)
-            return f"Document saved as: {file_path}"
-        else:
+            if not os.path.isabs(file_path):
+                # The existence check below runs in the server's working
+                # directory, CATIA's SaveAs in its own: refuse rather than
+                # report a false failure (or write somewhere unexpected).
+                raise InvalidArgument(
+                    f"file_path must be absolute (got {file_path!r}): CATIA resolves "
+                    "relative paths against its own working directory."
+                )
+            before_mtime = _mtime(file_path)
+            with file_alerts_off(self.conn.app):
+                doc.SaveAs(file_path)
+            with after_mutation():
+                after_mtime = _mtime(file_path)
+                if after_mtime is None:
+                    raise ObjectNotFound(
+                        f"SaveAs returned but no file exists at {file_path}. CATIA may "
+                        "have saved elsewhere (check the extension matches the document "
+                        "type) or refused silently.",
+                        modified=None,
+                    )
+            note = ""
+            if before_mtime is not None:
+                note = (
+                    " (an existing file was overwritten)"
+                    if after_mtime != before_mtime
+                    else " (warning: a file already existed there and its modification "
+                    "time did not change, so the save could not be confirmed)"
+                )
+            return f"Document saved as: {file_path}{note}"
+        with file_alerts_off(self.conn.app):
             doc.Save()
-            return f"Document '{doc.Name}' saved"
+        return f"Document '{doc.Name}' saved"
 
     def _close_document(self, save: bool = False) -> str:
         if self.conn.is_3dx:
             title = self.plm.title_of(self.conn.active_object())
             if save:
                 self.plm.propagate()
-            app = self.conn.app
-            previous_alerts = safe_get(app, "DisplayFileAlerts")
-            try:
-                if previous_alerts is not None:
-                    app.DisplayFileAlerts = False
+            with file_alerts_off(self.conn.app):
                 self.conn.active_window.Close()
-            finally:
-                if previous_alerts is not None:
-                    try:
-                        app.DisplayFileAlerts = previous_alerts
-                    except Exception:
-                        pass
             return f"Editor '{title}' closed" + (
                 " (saved to the database first)" if save else " (unsaved changes discarded)"
             )
         doc = self.conn.active_document
         name = doc.Name
-        if save:
-            doc.Save()
-        doc.Close()
+        # Alerts off: Close on a modified document would otherwise ask
+        # "save changes?" and block; with save=false the changes are dropped.
+        with file_alerts_off(self.conn.app):
+            if save:
+                doc.Save()
+            doc.Close()
         return f"Document '{name}' closed" + (" (saved)" if save else "")
 
     # ── List / info / activate ──

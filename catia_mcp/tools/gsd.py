@@ -47,6 +47,15 @@ class GSDTools:
     def __init__(self, connection: CATIAConnection) -> None:
         self.conn = connection
         self._active_geoset_name: str | None = None
+        self._created_points = 0
+
+    def reset_session_state(self) -> None:
+        """Forget per-session state after a CATIA reconnect: the remembered
+        active geometrical set belongs to the previous session's document,
+        and a sketch the sketcher held open is gone with that process."""
+        self._active_geoset_name = None
+        self._created_points = 0
+        self.conn.open_sketch = None
 
     # ────────────────────────────────────────────────────────────
     # Tool definitions

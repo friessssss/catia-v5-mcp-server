@@ -12,6 +12,7 @@ import json
 from typing import Any
 
 from catia_mcp.connection import CATIAConnection
+from catia_mcp.errors import InvalidArgument, ObjectNotFound
 from catia_mcp.references import element_or_face_reference
 
 # Plane name mapping
@@ -30,6 +31,31 @@ class SketcherTools:
         self.conn = connection
         self._active_sketch: Any | None = None
         self._active_factory: Any | None = None
+        self._sketch_part: Any | None = None
+
+    def reset_session_state(self) -> None:
+        """Drop the cached sketch, factory and part proxies after a CATIA
+        reconnect: they point into the previous CATIA process."""
+        self._clear_local_state()
+        self.conn.open_sketch = None
+
+    def _clear_local_state(self) -> None:
+        self._active_sketch = None
+        self._active_factory = None
+        self._sketch_part = None
+
+    def _open_elsewhere_closed(self) -> bool:
+        """True when this tool still holds a sketch that the shared
+        connection no longer lists as open.
+
+        The open sketch is published on the connection (``open_sketch``) so
+        Part Design tools can close it before building a feature on it;
+        when they do, or after a reconnect, the cached factory here is stale.
+        """
+        return (
+            self._active_sketch is not None
+            and getattr(self.conn, "open_sketch", None) is not self._active_sketch
+        )
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
         return [
@@ -285,8 +311,15 @@ class SketcherTools:
                 raise ValueError(f"Unknown sketcher tool: {tool_name}")
 
     def _ensure_sketch_open(self) -> None:
+        if self._open_elsewhere_closed():
+            self._clear_local_state()
+            raise ObjectNotFound(
+                "No active sketch: the last sketch was closed (automatically by a Part "
+                "Design feature, or by a CATIA reconnect). Use catia_create_sketch to "
+                "open a new sketch."
+            )
         if self._active_sketch is None:
-            raise RuntimeError(
+            raise ObjectNotFound(
                 "No active sketch. Use catia_create_sketch first to open a sketch."
             )
 
@@ -302,7 +335,7 @@ class SketcherTools:
             origin = part.OriginElements
             plane_key = plane.lower()
             if plane_key not in PLANE_MAP:
-                raise ValueError(f"Unknown plane '{plane}'. Use 'xy', 'yz', or 'zx'.")
+                raise InvalidArgument(f"Unknown plane '{plane}'. Use 'xy', 'yz', or 'zx'.")
 
             plane_attr = PLANE_MAP[plane_key]
             ref_plane = getattr(origin, plane_attr)
@@ -334,6 +367,9 @@ class SketcherTools:
                 )
             self._active_sketch = sketch
         self._active_factory = factory
+        # Shared with the Part Design tools, which close a sketch left open
+        # before building a feature (see PartDesignTools._close_open_sketch).
+        self.conn.open_sketch = sketch
 
         try:
             sketch_name = str(sketch.Name)
@@ -351,6 +387,16 @@ class SketcherTools:
         )
 
     def _close_sketch(self) -> str:
+        if self._open_elsewhere_closed():
+            try:
+                name = str(self._active_sketch.Name)
+            except Exception:
+                name = "sketch"
+            self._clear_local_state()
+            return (
+                f"Sketch '{name}' was already closed (automatically by a Part Design "
+                "feature or a CATIA reconnect); nothing to do."
+            )
         if self._active_sketch is None:
             # The cached handle does not survive a server restart while CATIA
             # keeps the sketch open in edition. Re-adopt the document's
@@ -360,6 +406,7 @@ class SketcherTools:
                 candidate = part.InWorkObject
                 getattr(candidate, "CloseEdition")
                 self._active_sketch = candidate
+                self.conn.open_sketch = candidate
             except Exception:
                 pass
         self._ensure_sketch_open()
@@ -375,8 +422,8 @@ class SketcherTools:
         finally:
             # Clear cached state even when the close fails, so a broken
             # handle cannot poison subsequent calls.
-            self._active_sketch = None
-            self._active_factory = None
+            self._clear_local_state()
+            self.conn.open_sketch = None
         self.conn.refresh_display()
         return (
             f"Sketch '{name}' closed. You can now apply Part Design features "
@@ -386,7 +433,7 @@ class SketcherTools:
     def _draw_line(self, x1: float, y1: float, x2: float, y2: float) -> str:
         self._ensure_sketch_open()
         factory = self._active_factory
-        line = factory.CreateLine(x1, y1, x2, y2)
+        factory.CreateLine(x1, y1, x2, y2)
         return f"Line created from ({x1}, {y1}) to ({x2}, {y2}) mm"
 
     def _draw_rectangle(self, x1: float, y1: float, x2: float, y2: float) -> str:
@@ -450,7 +497,7 @@ class SketcherTools:
             ctrl_pt = factory.CreatePoint(pt[0], pt[1])
             spline_pts.append(ctrl_pt)
 
-        spline = factory.CreateSpline(spline_pts)
+        factory.CreateSpline(spline_pts)
 
         if closed and len(points) >= 3:
             # Close the spline by adding a line from last to first point
@@ -510,9 +557,9 @@ class SketcherTools:
         # Dimensional constraints (need a geometry reference + value)
         if constraint_type in ("distance", "radius", "angle"):
             if value is None:
-                raise ValueError(f"Constraint type '{constraint_type}' requires a 'value' parameter.")
+                raise InvalidArgument(f"Constraint type '{constraint_type}' requires a 'value' parameter.")
             if idx1 is None:
-                raise ValueError(f"Constraint type '{constraint_type}' requires 'geometry_index_1'.")
+                raise InvalidArgument(f"Constraint type '{constraint_type}' requires 'geometry_index_1'.")
 
             if constraint_type == "distance" and idx2 is not None:
                 cst = constraints.AddBiEltCst(self._CST_DISTANCE, _ref(idx1), _ref(idx2))
@@ -523,7 +570,7 @@ class SketcherTools:
                 cst = constraints.AddMonoEltCst(self._CST_RADIUS, _ref(idx1))
             else:  # angle
                 if idx2 is None:
-                    raise ValueError("Angle constraint requires 'geometry_index_2'.")
+                    raise InvalidArgument("Angle constraint requires 'geometry_index_2'.")
                 cst = constraints.AddBiEltCst(self._CST_ANGLE, _ref(idx1), _ref(idx2))
             try:
                 # V5-6R2020: dimensional constraints must be driving to take
@@ -549,11 +596,11 @@ class SketcherTools:
 
         cst_code = cst_type_map.get(constraint_type)
         if cst_code is None:
-            raise ValueError(f"Unknown constraint type: {constraint_type}")
+            raise InvalidArgument(f"Unknown constraint type: {constraint_type}")
 
         if constraint_type in ("horizontal", "vertical", "fix"):
             if idx1 is None:
-                raise ValueError(f"Constraint '{constraint_type}' requires 'geometry_index_1'.")
+                raise InvalidArgument(f"Constraint '{constraint_type}' requires 'geometry_index_1'.")
             cst = constraints.AddMonoEltCst(cst_code, _ref(idx1))
             if constraint_type == "fix":
                 try:
@@ -564,7 +611,7 @@ class SketcherTools:
                     pass
         else:
             if idx1 is None or idx2 is None:
-                raise ValueError(
+                raise InvalidArgument(
                     f"Constraint '{constraint_type}' requires both 'geometry_index_1' and 'geometry_index_2'."
                 )
             cst = constraints.AddBiEltCst(cst_code, _ref(idx1), _ref(idx2))

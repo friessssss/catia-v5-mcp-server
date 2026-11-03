@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "catia-v5-mcp-server"
-version = "0.2.2"
+version = "0.3.0"
 description = "MCP Server for CATIA V5 and CATIA 3DEXPERIENCE (V6) - Connect AI agents to Dassault Systèmes CATIA via COM Automation"
 readme = "README.md"
 license = "MIT"
@@ -18,11 +18,18 @@ dependencies = [
     "mcp>=1.27.0,<2",
     # COM automation only exists on Windows; the marker lets the offline
     # test suite install on other platforms.
-    "pywin32>=306; sys_platform == 'win32'",
+    "pywin32>=311; sys_platform == 'win32'",
     "jsonschema>=4.20,<5",
+    # Streamable HTTP service (catia-mcp serve) and the stdio proxy; both
+    # already come with mcp, listed because the service imports them directly.
+    "httpx>=0.27.1",
+    "uvicorn>=0.31.1",
 ]
 
 [project.optional-dependencies]
+# Image post-processing for catia_screenshot (resize / re-encode before the
+# picture is returned to the agent). The tools work without it.
+images = ["Pillow>=10"]
 dev = [
     "pytest>=7.0",
     "ruff>=0.4.0",
@@ -30,6 +37,11 @@ dev = [
 
 [project.scripts]
 catia-mcp = "catia_mcp.server:main"
+
+# Windowless launcher (no console window flashes up): `catia-mcpw serve`
+# runs the background service the same way the logon autostart does.
+[project.gui-scripts]
+catia-mcpw = "catia_mcp.server:main"
 
 [tool.setuptools.packages.find]
 include = ["catia_mcp*"]

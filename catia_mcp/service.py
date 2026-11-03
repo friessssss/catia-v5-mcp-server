@@ -62,6 +62,32 @@ def health(port: int = DEFAULT_PORT, timeout: float = 2.0, token: str | None = N
     return data if isinstance(data, dict) and data.get("service") == "catia-mcp" else None
 
 
+def acquire_instance_lock(port: int) -> Any | None:
+    """Hold a per-user, per-port lock for the life of the process, or return
+    None when another serve process holds it (logon autostart and a proxy
+    can race to start the service)."""
+    if os.name == "nt":
+        try:
+            import win32api
+            import win32event
+            import winerror
+        except ImportError:
+            return object()
+        handle = win32event.CreateMutex(None, False, f"Local\\catia-mcp-{port}")
+        if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+            return None
+        return handle
+    import fcntl
+
+    lock = open(state_dir() / f"serve-{port}.lock", "w")  # noqa: SIM115 -- process lifetime
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        return None
+    return lock
+
+
 def pid_file() -> Path:
     return state_dir() / "server.json"
 
@@ -103,7 +129,7 @@ def start_detached(port: int = DEFAULT_PORT) -> subprocess.Popen:
             | subprocess.CREATE_NEW_PROCESS_GROUP
             | subprocess.CREATE_NO_WINDOW
         )
-    return subprocess.Popen(  # noqa: S603 -- our own interpreter and module
+    return subprocess.Popen(
         serve_command(port),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -141,7 +167,7 @@ def stop(port: int = DEFAULT_PORT) -> str:
             f"A server answers on port {port} but left no PID file; stop it from Task Manager."
         )
     if os.name == "nt":
-        subprocess.run(  # noqa: S603, S607 -- system tool
+        subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False
         )
     else:
@@ -262,14 +288,14 @@ def configure_claude_code(port: int, remove: bool = False) -> str:
             "Claude Code CLI not found. If you use it later, run:\n"
             f"    claude mcp add --scope user --transport http {SERVER_NAME} {mcp_url(port)}"
         )
-    subprocess.run(  # noqa: S603 -- user's own CLI
+    subprocess.run(
         [claude, "mcp", "remove", "--scope", "user", SERVER_NAME],
         capture_output=True,
         check=False,
     )
     if remove:
         return f"Removed '{SERVER_NAME}' from Claude Code."
-    done = subprocess.run(  # noqa: S603
+    done = subprocess.run(
         [claude, "mcp", "add", "--scope", "user", "--transport", "http", SERVER_NAME, mcp_url(port)],
         capture_output=True,
         text=True,
@@ -334,6 +360,10 @@ def status_lines(port: int = DEFAULT_PORT) -> list[str]:
         if busy:
             lines.append(f"Busy: {busy['tool']} for {busy['seconds']:.0f} s")
         lines.append(f"Tool calls served: {data.get('calls', 0)}")
+        lines.append(
+            f"Commit: {data.get('commit') or 'unknown'}; scripts "
+            f"{'on' if data.get('scripts') else 'off'}; toolset {data.get('toolset')}"
+        )
     if os.name == "nt":
         lines.append(f"Autostart: {'on' if autostart else 'off'}")
     lines.append(f"Logs: {log_path()}")
