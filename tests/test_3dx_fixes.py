@@ -116,7 +116,7 @@ def test_refused_3d_part_falls_back_at_once_and_is_cached_for_the_session():
     # The second 'auto' call goes straight to 3DShape.
     assert service.attempts == ["3DPart", "3DShape", "3DShape"]
     assert "3DShape 'A'" in text(first) and "PLMCreate failed" in text(first)
-    assert "earlier in this session" in text(second) and "3DShape 'B'" in text(second)
+    assert "earlier on this machine" in text(second) and "3DShape 'B'" in text(second)
 
 
 def test_explicit_3d_part_is_still_attempted_and_refused_untouched():
@@ -177,16 +177,40 @@ def test_invalid_default_plm_type_env_is_refused_before_creating(monkeypatch):
     assert service.attempts == []
 
 
-def test_refusal_cache_is_dropped_when_the_connection_gets_a_new_application():
+def test_refusal_survives_reconnect_and_restart_but_expires(monkeypatch):
+    # Live R428: every refused 3D Part attempt shows a licence dialog, so a
+    # refusal is remembered on disk, across CATIA reconnects and service
+    # restarts, until it expires (a newly granted role is then tried again).
+    import catia_mcp.plm as plm_module
+
     app = App3DX()
     app.session_services["PLMNewService"] = FieldRefusingService(app)
     conn = connected(app)
     plm = PLMSession(conn)
     with pytest.raises(PLMCreateRefused):
         plm.create("3DPart")
-    assert PLMSession(conn).refused("3DPart") == "The method PLMCreate failed"
     conn.app = App3DX()  # reconnect: new Application proxy
-    assert plm.refused("3DPart") is None
+    assert plm.refused("3DPart") == "The method PLMCreate failed"
+    fresh = PLMSession(connected(App3DX()))  # new server process, same machine
+    assert fresh.refused("3DPart") == "The method PLMCreate failed"
+    import time
+
+    later = time.time() + plm_module.REFUSAL_TTL_S + 1
+    monkeypatch.setattr(time, "time", lambda: later)
+    assert PLMSession(connected(App3DX())).refused("3DPart") is None
+
+
+def test_execution_error_from_the_script_engine_counts_as_refusal():
+    from catia_mcp.plm import catia_refused
+
+    live = Exception(
+        -2147352567, "Exception occurred.",
+        (0, None, "ExecuteScript(Evaluate, MemoryMacro, catia_mcp_obj)\nExecution error\n"
+         "(The scripting engine for CATScript has reported the following error:\n\n"
+         "Description: Unspecified error\nLine: 3\n)", None, 0, -2147467259), None,
+    )
+    assert catia_refused(live)
+    assert not catia_refused(Exception("Execution error: Syntax error on line 2"))
 
 
 def test_display_file_alerts_are_off_during_plm_create_and_restored():
@@ -228,7 +252,7 @@ def test_add_new_part_refused_is_unsupported_and_quotes_the_refusal():
         assert result.structuredContent["code"] == "UNSUPPORTED_CAPABILITY"
         assert "PLMCreate failed" in result.structuredContent["message"]
         assert result.structuredContent["effects"]["modified"] is False
-    assert "earlier in this session" in cached.structuredContent["message"]
+    assert "earlier" in cached.structuredContent["message"]
     assert service.attempts == ["3DPart"]  # the cached call did not ask CATIA again
 
 
@@ -470,3 +494,16 @@ def test_malformed_inertia_cog_keeps_the_matrix(monkeypatch):
     result = json.loads(tools._get_inertia())
     assert result["inertia_matrix_kg_m2"][0][0] == 0.0001
     assert result["inertia_cog_mm"].startswith("unavailable")
+
+
+def test_refused_physical_product_is_not_retried():
+    app = App3DX()
+    service = FieldRefusingService(app, refuse=("VPMReference",))
+    app.session_services["PLMNewService"] = service
+    first = call(server_on(app), "catia_new_product", {})
+    assert first.isError
+    attempts = list(service.attempts)
+    second = call(server_on(app), "catia_new_product", {})
+    assert second.structuredContent["code"] == "UNSUPPORTED_CAPABILITY"
+    assert "not retried" in second.structuredContent["message"]
+    assert service.attempts == attempts == ["VPMReference"]  # not asked again

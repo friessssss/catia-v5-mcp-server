@@ -106,7 +106,63 @@ def catia_refused(error: Exception) -> bool:
         or "CATIAPLMOpenService" in text
         or "method plmcreate failed" in lowered
         or _not_authorized(error)
+        # The CATScript engine ran the macro and the call inside it raised
+        # (live R428: "Execution error ... Description: Unspecified error"
+        # for a 3D Part the licence refuses). Only a script that never ran
+        # (compile error, no SystemService) is worth the direct-call retry.
+        or ("execution error" in lowered and "syntax" not in lowered)
     )
+
+
+# PLMCreate refusals outlive the session: each refused attempt shows a
+# modal licence dialog the user must click away, so after one refusal on
+# this machine 'auto' creation goes straight to the fallback type. Entries
+# expire so a newly granted role is tried again; an explicit plm_type is
+# always attempted.
+REFUSAL_TTL_S = 30 * 24 * 3600
+
+
+def _refusals_file() -> Any:
+    from catia_mcp.paths import state_dir
+
+    return state_dir() / "plm_refusals.json"
+
+
+def load_persisted_refusals() -> dict[str, str]:
+    import json
+    import time
+
+    try:
+        data = json.loads(_refusals_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    now = time.time()
+    return {
+        kind: str(entry.get("reason", ""))
+        for kind, entry in data.items()
+        if isinstance(entry, dict) and now - float(entry.get("at", 0)) < REFUSAL_TTL_S
+    }
+
+
+def persist_refusal(plm_type: str, reason: str | None) -> None:
+    """Record (reason) or clear (None) a refusal on disk; best effort."""
+    import json
+    import time
+
+    try:
+        path = _refusals_file()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if reason is None:
+            if data.pop(plm_type, None) is None:
+                return
+        else:
+            data[plm_type] = {"reason": reason, "at": time.time()}
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def refusal_summary(error: Exception) -> str:
@@ -208,12 +264,20 @@ class PLMSession:
         cached = getattr(self.conn, _REFUSALS_ATTR, None)
         app = self.conn.app
         if not cached or cached[0] is not app:
-            cached = (app, {})
+            cached = (app, load_persisted_refusals())
             setattr(self.conn, _REFUSALS_ATTR, cached)
         return cached[1]
 
     def refused(self, plm_type: str) -> str | None:
         return self.refusals().get(plm_type)
+
+    def remember_refusal(self, plm_type: str, reason: str) -> None:
+        self.refusals()[plm_type] = reason
+        persist_refusal(plm_type, reason)
+
+    def forget_refusal(self, plm_type: str) -> None:
+        if self.refusals().pop(plm_type, None) is not None:
+            persist_refusal(plm_type, None)
 
     def reset_refusals(self) -> None:
         setattr(self.conn, _REFUSALS_ATTR, None)
@@ -237,14 +301,14 @@ class PLMSession:
                 if before is not None and after is not None and after > before:
                     # The object was created but the out-parameter could not
                     # be read back: the new editor is the active one.
-                    self.refusals().pop(plm_type, None)
+                    self.forget_refusal(plm_type)
                     return self.conn.active_editor
                 counted = before is not None and after is not None
                 if catia_refused(script_error):
                     refusal = PLMCreateRefused(
                         plm_type, script_error, modified=False if counted else None
                     )
-                    self.refusals()[plm_type] = refusal.reason
+                    self.remember_refusal(plm_type, refusal.reason)
                     raise refusal from script_error
                 try:
                     # pywin32 with type information returns out-parameters.
@@ -253,7 +317,7 @@ class PLMSession:
                     raise script_error from None
         # Success (e.g. an explicit retry after a role change): forget any
         # earlier refusal so later 'auto' calls try this type again.
-        self.refusals().pop(plm_type, None)
+        self.forget_refusal(plm_type)
         if editor is None or not resolves(editor, "ActiveObject"):
             editor = self.conn.active_editor
         return editor
@@ -282,9 +346,9 @@ class PLMSession:
             cached = self.refused(kind)
             if cached is not None and kind != attempts[-1]:
                 notes.append(
-                    f"A {kind} was refused earlier in this session ({cached}), so a "
-                    f"{attempts[-1]} was created directly; it has no product node of "
-                    f"its own. Reconnect or pass plm_type='{kind}' to try again."
+                    f"A {kind} was refused earlier on this machine ({cached}), so a "
+                    f"{attempts[-1]} was created directly (no licence dialog); it has no "
+                    f"product node of its own. Pass plm_type='{kind}' to try again."
                 )
                 continue
             try:
@@ -292,6 +356,10 @@ class PLMSession:
             except Exception as error:  # 'auto' falls back on any failure
                 reason = error.reason if isinstance(error, PLMCreateRefused) else refusal_summary(error)
                 refusals.append(f"{kind}: {reason}")
+                if kind != attempts[-1]:
+                    # Whatever the wording, a failed attempt cost the user a
+                    # dialog; do not try it again on the next 'auto' create.
+                    self.remember_refusal(kind, reason)
                 if kind == attempts[-1]:
                     raise UnsupportedCapability(
                         "3DEXPERIENCE refused to create the part ("
@@ -300,11 +368,7 @@ class PLMSession:
                         "selected, and hold a role allowing creation.",
                         modified=getattr(error, "modified", None),
                     ) from error
-                later = (
-                    f" Later 'auto' creations in this session go straight to {attempts[-1]}."
-                    if isinstance(error, PLMCreateRefused)
-                    else ""
-                )
+                later = f" Later 'auto' creations go straight to {attempts[-1]}."
                 notes.append(
                     f"A {kind} could not be created ({reason}), so a {attempts[-1]} was "
                     f"created instead; it has no product node of its own.{later}"

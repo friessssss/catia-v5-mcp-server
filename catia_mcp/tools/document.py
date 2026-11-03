@@ -301,6 +301,15 @@ class DocumentTools:
     def _new_product(self, name: str | None = None) -> str:
         self.conn.ensure_connected()
         if self.conn.is_3dx:
+            cached = self.plm.refused("VPMReference")
+            if cached is not None:
+                # Each refused attempt shows a licence dialog: do not ask again.
+                raise UnsupportedCapability(
+                    f"3DEXPERIENCE refused to create a Physical Product earlier on this "
+                    f"machine ({cached}); not retried, to avoid another licence dialog. "
+                    "Create the product in the UI or open an existing one with "
+                    "catia_open_from_database."
+                )
             try:
                 self.plm.create("VPMReference")
             except Exception as e:

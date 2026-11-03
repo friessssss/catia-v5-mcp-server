@@ -63,6 +63,13 @@ All notable changes to this project are documented here.
   connection (`CATIA_MCP_DEFAULT_PLM_TYPE` skips it), and file alerts are
   suppressed around PLMCreate/PLMOpen. `catia_add_new_part` fails fast with
   the cached refusal.
+- Licence dialogs on every new part (live R428): a refused 3D Part raised
+  "Execution error ... Unspecified error", which was not recognised as a
+  refusal, so it was retried and never remembered. Script-engine execution
+  errors now count as refusals, any failed 'auto' attempt is remembered, and
+  refusals persist on disk for 30 days (`plm_refusals.json` in the state
+  folder), so the dialog appears at most once per machine. A refused
+  Physical Product is not retried either.
 - Fillet, chamfer, pad, shaft, groove and hole delete a feature whose update
   fails (`FEATURE_UPDATE_FAILED`) instead of leaving it broken in the tree;
   inputs are validated first.
