@@ -100,6 +100,24 @@ class Measurer:
         except AttributeError:
             return self.conn.app.GetWorkbench("SPAWorkbench")
 
+    def v5_measurable(self, ref: Any) -> Any:
+        """SPAWorkbench.GetMeasurable(ref), re-dispatched.
+
+        On V5-6R2020 (B30), Measurable scalars obtained through pywin32
+        late-bound dynamic dispatch (Volume, Area) read 0; re-wrapping the
+        object with ``win32com.client.Dispatch`` binds its type information
+        and yields real values (field-verified against exact primitive
+        volumes). The re-wrap is a no-op where the dispatch already carries
+        type info (e.g. V5R20).
+        """
+        measurable = self.spa_workbench().GetMeasurable(ref)
+        try:
+            import win32com.client
+
+            return win32com.client.Dispatch(measurable)
+        except Exception:
+            return measurable
+
     # ── 3DEXPERIENCE typed measurables ──
 
     def _service(self) -> Any:
@@ -197,7 +215,7 @@ class Measurer:
             measurable = self._measurable_any_target(part, obj, "volume")
             return self.scalar(measurable, ("GetVolume", "Volume")) * M3_TO_MM3
         ref = part.CreateReferenceFromObject(obj)
-        return self.spa_workbench().GetMeasurable(ref).Volume * M3_TO_MM3
+        return self.v5_measurable(ref).Volume * M3_TO_MM3
 
     def body_volume_mm3(self, part: Any, body: Any) -> float | None:
         """Measure a body's solid volume in mm3, or None if unavailable."""
@@ -211,7 +229,7 @@ class Measurer:
             measurable = self._measurable_any_target(part, obj, "volume")
             return self.scalar(measurable, ("GetArea", "Area")) * M2_TO_MM2
         ref = part.CreateReferenceFromObject(obj)
-        return self.spa_workbench().GetMeasurable(ref).Area * M2_TO_MM2
+        return self.v5_measurable(ref).Area * M2_TO_MM2
 
     def cog_mm(self, part: Any, obj: Any) -> list[float]:
         if self.conn.is_3dx:
@@ -221,13 +239,13 @@ class Measurer:
             method = "GetCOfG" if name_exists(measurable, "GetCOfG") else "GetCOG"
             return self._triple(measurable, method)
         ref = part.CreateReferenceFromObject(obj)
-        return call_fill_array(self.conn.app, self.spa_workbench().GetMeasurable(ref), "GetCOG", 3)
+        return call_fill_array(self.conn.app, self.v5_measurable(ref), "GetCOG", 3)
 
     def point_mm(self, ref: Any) -> list[float]:
         """Coordinates of a vertex / point Reference, in mm."""
         if self.conn.is_3dx:
             return self._triple(self.measurable_3dx(ref, "point"), "GetPoint")
-        return call_fill_array(self.conn.app, self.spa_workbench().GetMeasurable(ref), "GetPoint", 3)
+        return call_fill_array(self.conn.app, self.v5_measurable(ref), "GetPoint", 3)
 
     def plane(self, ref: Any) -> list[float]:
         """GetPlane components: origin (3), first axis (3), second axis (3)."""
@@ -237,7 +255,7 @@ class Measurer:
                 return call_fill_array(self.conn.app, measurable, "GetPlane", 9)
             except Exception:
                 return [float(v) for v in call_out_values(self.conn.app, measurable, "GetPlane", 9)]
-        return call_fill_array(self.conn.app, self.spa_workbench().GetMeasurable(ref), "GetPlane", 9)
+        return call_fill_array(self.conn.app, self.v5_measurable(ref), "GetPlane", 9)
 
     def min_distance(self, ref1: Any, ref2: Any) -> dict[str, Any]:
         """Minimum distance in mm; on 3DEXPERIENCE also the closest point on
@@ -261,7 +279,7 @@ class Measurer:
             }
         # Area/Volume are MKS (field-confirmed on V5); the minimum distance is
         # assumed MKS too and converted to mm. Not yet field-verified.
-        distance = self.spa_workbench().GetMeasurable(ref1).GetMinimumDistance(ref2) * M_TO_MM
+        distance = self.v5_measurable(ref1).GetMinimumDistance(ref2) * M_TO_MM
         return {"distance_mm": distance}
 
     def min_distance_mm(self, ref1: Any, ref2: Any) -> float:

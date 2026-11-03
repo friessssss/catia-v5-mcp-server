@@ -1,8 +1,8 @@
 {
   "totals": {
-    "count": 10039,
-    "uniques_last_seen": 544,
-    "count_last_window": 1415
+    "count": 12598,
+    "uniques_last_seen": 767,
+    "count_last_window": 1868
   },
   "history": [
     {
@@ -769,6 +769,106 @@
       "timestamp": "2026-10-12T00:00:00Z",
       "count": 199,
       "uniques": 67
+    },
+    {
+      "timestamp": "2026-10-13T00:00:00Z",
+      "count": 145,
+      "uniques": 66
+    },
+    {
+      "timestamp": "2026-10-14T00:00:00Z",
+      "count": 167,
+      "uniques": 89
+    },
+    {
+      "timestamp": "2026-10-15T00:00:00Z",
+      "count": 138,
+      "uniques": 73
+    },
+    {
+      "timestamp": "2026-10-16T00:00:00Z",
+      "count": 87,
+      "uniques": 55
+    },
+    {
+      "timestamp": "2026-10-17T00:00:00Z",
+      "count": 82,
+      "uniques": 41
+    },
+    {
+      "timestamp": "2026-10-18T00:00:00Z",
+      "count": 72,
+      "uniques": 35
+    },
+    {
+      "timestamp": "2026-10-19T00:00:00Z",
+      "count": 83,
+      "uniques": 51
+    },
+    {
+      "timestamp": "2026-10-20T00:00:00Z",
+      "count": 74,
+      "uniques": 45
+    },
+    {
+      "timestamp": "2026-10-21T00:00:00Z",
+      "count": 61,
+      "uniques": 38
+    },
+    {
+      "timestamp": "2026-10-22T00:00:00Z",
+      "count": 42,
+      "uniques": 34
+    },
+    {
+      "timestamp": "2026-10-23T00:00:00Z",
+      "count": 91,
+      "uniques": 56
+    },
+    {
+      "timestamp": "2026-10-24T00:00:00Z",
+      "count": 159,
+      "uniques": 92
+    },
+    {
+      "timestamp": "2026-10-25T00:00:00Z",
+      "count": 107,
+      "uniques": 49
+    },
+    {
+      "timestamp": "2026-10-26T00:00:00Z",
+      "count": 228,
+      "uniques": 117
+    },
+    {
+      "timestamp": "2026-10-27T00:00:00Z",
+      "count": 144,
+      "uniques": 74
+    },
+    {
+      "timestamp": "2026-10-28T00:00:00Z",
+      "count": 299,
+      "uniques": 106
+    },
+    {
+      "timestamp": "2026-10-29T00:00:00Z",
+      "count": 227,
+      "uniques": 105
+    },
+    {
+      "timestamp": "2026-10-30T00:00:00Z",
+      "count": 183,
+      "uniques": 74
+    },
+    {
+      "timestamp": "2026-10-31T00:00:00Z",
+      "count": 111,
+      "uniques": 48
+    },
+    {
+      "timestamp": "2026-11-01T00:00:00Z",
+      "count": 59,
+      "uniques": 37
     }
   ]
 }

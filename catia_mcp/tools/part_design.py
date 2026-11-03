@@ -31,6 +31,47 @@ from catia_mcp.references import (
 )
 
 
+def _set_prop(obj: Any, name: str, value: Any) -> bool:
+    """Set a COM property with a parameter-object fallback.
+
+    Direct property PUTs can fail under dynamic dispatch on objects returned
+    by factory methods (field-verified on V5-6R2020); properties exposed as
+    parameter objects are then set through their ``Value`` attribute.
+    """
+    try:
+        setattr(obj, name, value)
+        return True
+    except Exception:
+        try:
+            getattr(obj, name).Value = value
+            return True
+        except Exception:
+            return False
+
+
+def _force_solid_inwork(part: Any, sketch: Any) -> None:
+    """Make the body owning ``sketch`` the in-work object.
+
+    Freshly created Part documents start with a Geometrical Set as the
+    in-work object; Pad/Pocket/Hole/Shaft/Groove then fail with E_FAIL
+    (field-verified on V5-6R2020). ``Sketch.Parent`` is the Sketches
+    collection, so climb one more level to reach the owning Body.
+    """
+    try:
+        target = part.MainBody
+        try:
+            parent = sketch.Parent
+            if getattr(parent, "Name", "") in ("Sketches", "HybridSketches"):
+                parent = parent.Parent
+            if parent is not None:
+                target = parent
+        except Exception:
+            pass
+        part.InWorkObject = target
+    except Exception:
+        pass
+
+
 class PartDesignTools:
     """Tools for 3D Part Design features in CATIA V5 and 3DEXPERIENCE."""
 
@@ -95,6 +136,11 @@ class PartDesignTools:
                             "enum": ["normal", "reverse"],
                             "default": "normal",
                         },
+                        "symmetric": {
+                            "type": "boolean",
+                            "description": "If true, mirrored extent: cuts equally on both sides (reliable on V5-6R2020, where DirectionOrientation may not flip the cut side)",
+                            "default": False,
+                        },
                         "sketch_name": {
                             "type": "string",
                             "description": "Name of sketch to use. If not specified, uses the last sketch.",
@@ -108,7 +154,8 @@ class PartDesignTools:
                 "description": (
                     "Create a Shaft (revolution) from the last sketch. "
                     "Revolves a 2D profile around an axis to create a solid of revolution. "
-                    "The sketch must contain a line to use as the revolution axis."
+                    "The revolution axis is the sketch's own V direction (AbsoluteAxis); "
+                    "do not draw an axis line (rejected on V5-6R2020)."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -760,6 +807,10 @@ class PartDesignTools:
         sf = part.ShapeFactory
 
         sketch = self._get_last_sketch(args.get("sketch_name"))
+        # V5-6R2020: solid features fail with E_FAIL unless the sketch's
+        # owning BODY is the in-work object (fresh documents start on a
+        # Geometrical Set).
+        _force_solid_inwork(part, sketch)
         height = args["height"]
         direction = args.get("direction", "normal")
         symmetric = args.get("symmetric", False)
@@ -788,16 +839,32 @@ class PartDesignTools:
         sf = part.ShapeFactory
 
         sketch = self._get_last_sketch(args.get("sketch_name"))
+        # V5-6R2020: see _pad - the sketch's owning body must be in-work.
+        _force_solid_inwork(part, sketch)
         depth = args["depth"]
         reverse = args.get("direction") == "reverse"
+        symmetric = args.get("symmetric", False)
 
         before = self._body_volume_mm3(part, body)
 
         pocket = sf.AddNewPocket(sketch, depth)
-        # A pocket cuts on one side of the profile's support plane only, so
-        # the orientation is set explicitly in both cases (field-verified:
-        # the wrong side produces a tree feature that removes nothing).
-        pocket.DirectionOrientation = 1 if reverse else 0
+        if symmetric:
+            # Mirrored extent: cuts equally on both sides. Reliable on
+            # V5-6R2020, where DirectionOrientation is accepted but may not
+            # flip the cut side. Set through the parameter-object fallback:
+            # direct PUTs can fail on factory-returned objects.
+            if not _set_prop(pocket, "IsSymmetric", True):
+                raise RuntimeError(
+                    f"Pocket '{pocket.Name}' was created but CATIA rejected the symmetric "
+                    "extent, so it is one-sided. Delete it with catia_delete_feature or "
+                    "retry without 'symmetric'."
+                )
+        else:
+            # A pocket cuts on one side of the profile's support plane only,
+            # so the orientation is set explicitly in both cases
+            # (field-verified: the wrong side produces a tree feature that
+            # removes nothing).
+            pocket.DirectionOrientation = 1 if reverse else 0
         part.UpdateObject(pocket)
 
         explicit_direction = "direction" in args
@@ -808,6 +875,7 @@ class PartDesignTools:
             and after is not None
             and after >= before
             and not explicit_direction
+            and not symmetric
         ):
             # No material removed and the caller did not pin the side: flip
             # and re-verify instead of reporting a false success. An explicit
@@ -858,10 +926,27 @@ class PartDesignTools:
         sketch = self._get_last_sketch(args.get("sketch_name"))
         angle = args.get("angle", 360)
 
+        # V5-6R2020: see _pad - the sketch's owning body must be in-work.
+        _force_solid_inwork(part, sketch)
         shaft = sf.AddNewShaft(sketch)
-        shaft.FirstAngle = angle
+        # V5-6R2020: drive the revolution axis from the sketch's own reference
+        # frame (AbsoluteAxis.VDirection); a drawn-line axis raises E_FAIL and
+        # wrapping the sketch raises DISP_E_BADTYPE. FirstAngle goes through
+        # the parameter-object fallback (direct PUTs fail on factory-returned
+        # objects under dynamic dispatch).
+        abs_axis = sketch.GeometricElements.Item("AbsoluteAxis")
+        vdir = abs_axis.GetItem("VDirection")
+        shaft.RevoluteAxis = part.CreateReferenceFromObject(vdir)
+        if not _set_prop(shaft, "FirstAngle", angle):
+            raise RuntimeError(
+                f"Shaft '{shaft.Name}' was created but its angle could not be set to "
+                f"{angle} degrees. Delete it with catia_delete_feature before retrying."
+            )
 
-        part.UpdateObject(shaft)
+        try:
+            part.UpdateObject(shaft)
+        except Exception:
+            part.Update()
         self.conn.refresh_display()
         return f"Shaft (revolution) created: {angle}°. Feature: '{shaft.Name}'"
 
@@ -874,10 +959,24 @@ class PartDesignTools:
         sketch = self._get_last_sketch(args.get("sketch_name"))
         angle = args.get("angle", 360)
 
+        # V5-6R2020: see _pad - the sketch's owning body must be in-work.
+        _force_solid_inwork(part, sketch)
         groove = sf.AddNewGroove(sketch)
-        groove.FirstAngle = angle
+        # V5-6R2020: revolution axis from the sketch's AbsoluteAxis.VDirection
+        # (see _shaft); FirstAngle through the parameter-object fallback.
+        abs_axis = sketch.GeometricElements.Item("AbsoluteAxis")
+        vdir = abs_axis.GetItem("VDirection")
+        groove.RevoluteAxis = part.CreateReferenceFromObject(vdir)
+        if not _set_prop(groove, "FirstAngle", angle):
+            raise RuntimeError(
+                f"Groove '{groove.Name}' was created but its angle could not be set to "
+                f"{angle} degrees. Delete it with catia_delete_feature before retrying."
+            )
 
-        part.UpdateObject(groove)
+        try:
+            part.UpdateObject(groove)
+        except Exception:
+            part.Update()
         self.conn.refresh_display()
         return f"Groove (revolution cut) created: {angle}°. Feature: '{groove.Name}'"
 
@@ -984,6 +1083,8 @@ class PartDesignTools:
         sketch = self._get_last_sketch(args.get("sketch_name"))
         before = self._body_volume_mm3(part, body)
 
+        # V5-6R2020: see _pad - the sketch's owning body must be in-work.
+        _force_solid_inwork(part, sketch)
         # AddNewHole takes a support FACE reference; the sketch-positioned
         # form is AddNewHoleFromSketch. Diameter is a read-only Length
         # parameter object whose .Value is assigned.
@@ -1017,8 +1118,10 @@ class PartDesignTools:
             except Exception:
                 type_note = f" Type '{hole_type}' not applied (API rejected it); simple hole created."
 
-        if args.get("threaded", False):
-            hole.ThreadingMode = 1  # catThreaded
+        try:
+            part.UpdateObject(hole)
+        except Exception:
+            part.Update()
 
         part.UpdateObject(hole)
         threshold = self._HOLE_NO_EFFECT_FRACTION * math.pi * diameter**2 * depth / 4.0
@@ -1040,6 +1143,24 @@ class PartDesignTools:
                     code="FEATURE_NO_EFFECT",
                     modified=None,
                 )
+
+        if args.get("threaded", False):
+            # V5-6R2020: threading a hole that has not materialized yet
+            # breaks the rebuild, so apply it AFTER the first update. B30
+            # type libraries: CatHoleThreadingMode threaded = 0 (1 = smooth).
+            if not _set_prop(hole, "ThreadingMode", 0):
+                raise RuntimeError(
+                    f"Hole '{hole.Name}' was created but CATIA rejected the threading "
+                    "mode, so it is smooth. Retry without 'threaded' or thread it in CATIA."
+                )
+            try:
+                part.Update()
+            except Exception as error:
+                raise RuntimeError(
+                    f"Hole '{hole.Name}' was threaded but the part update failed ({error}). "
+                    "Inspect the hole in CATIA before continuing."
+                ) from error
+            type_note += " Threaded."
         self.conn.refresh_display()
         summary = (
             f"Hole '{hole.Name}' created: D{diameter} mm, depth {applied_depth:g} mm"

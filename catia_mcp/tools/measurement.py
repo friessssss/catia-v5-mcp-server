@@ -402,7 +402,7 @@ class MeasurementTools:
                 pass
             result["units_note"] = UNIT_NOTE_3DX
         else:
-            measurable = self.measure.spa_workbench().GetMeasurable(ref)
+            measurable = self.measure.v5_measurable(ref)
             for attr, label, scale in (
                 ("Volume", "volume_mm3", M3_TO_MM3),
                 ("Area", "area_mm2", M2_TO_MM2),
