@@ -75,7 +75,11 @@ function Invoke-Native {
     $saved = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        & $Exe @Arguments
+        # Out-Host: a function returns everything written to its output
+        # stream, so a program's console text would otherwise be mixed into
+        # the caller's return value (the uv installer's banner became part
+        # of the uv.exe path on a live run).
+        & $Exe @Arguments | Out-Host
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $saved
@@ -118,7 +122,7 @@ function Install-Uv {
                "re-run this installer, or check $env:USERPROFILE\.local\bin\uv.exe.")
     }
     Write-Note "uv installed: $uv"
-    return $uv
+    return [string]$uv
 }
 
 function Get-ToolBin([string]$Uv) {

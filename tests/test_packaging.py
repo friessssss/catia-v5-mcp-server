@@ -74,6 +74,9 @@ def test_installer_scripts_exist_and_name_the_package():
     ps1 = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
     assert "uv tool install" in ps1 or "'tool', 'install'" in ps1
     assert "catia-v5-mcp-server[images]" in ps1 or "$PackageName[images]" in ps1
+    # Live R428 laptop: native output leaked into Install-Uv's return value
+    # and PowerShell tried to run the uv banner as the uv.exe path.
+    assert "& $Exe @Arguments | Out-Host" in ps1
     assert "Set-StrictMode" in ps1 and "$ErrorActionPreference = 'Stop'" in ps1
     assert "[switch]$Uninstall" in ps1
     # Windows PowerShell 5.1 reads BOM-less scripts as ANSI: keep it ASCII.
