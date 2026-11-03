@@ -25,6 +25,13 @@ CATIA refusing the call, not the Evaluate detour failing, so retrying through
 the direct (pywin32 out-parameter) call only cost time: catia_new_part took
 ~55 s before falling back to a 3D Shape. Refusals are now raised at once and
 remembered per connection, so later 'auto' creations go straight to 3D Shape.
+
+Site types (2026-11-02 field report, R428 SP6): the same user who got
+"PLMCreate failed" for 3DPart / VPMReference creates 3D Parts and Physical
+Products in the UI. 'auto' creation therefore also tries the customized type
+of content open in the session (PLMEntity.GetCustomType, UNVERIFIED on R428)
+and remembers a type that worked in state_dir()/plm_types.json.
+scripts/probe_3dx.py collects the live evidence.
 """
 
 from __future__ import annotations
@@ -36,6 +43,7 @@ from typing import Any
 
 from catia_mcp.automation import (
     call_out_object,
+    com_name,
     get_member,
     iter_items,
     name_exists,
@@ -45,16 +53,21 @@ from catia_mcp.automation import (
 from catia_mcp.connection import CATIAConnection
 from catia_mcp.errors import (
     AmbiguousTarget,
+    CATIAToolError,
     InvalidArgument,
     ObjectNotFound,
     UnsupportedCapability,
 )
 
 # Attributes read for search results and attribute reports. Not every type
-# carries every attribute; missing ones are skipped.
+# carries every attribute; missing ones are skipped. V_PartNumber holds the
+# Enterprise Item Number (EIN) on the 3D Part's root VPMReference
+# (field-proven on R428 SP6, 2026-11-02 field report: the drawing attribute
+# link "VPMReference" / "V_PartNumber" showed the EIN).
 STANDARD_ATTRIBUTES = (
     "V_Name",
     "PLM_ExternalID",
+    "V_PartNumber",
     "revision",
     "V_description",
     "current",
@@ -80,6 +93,48 @@ CREATE_TYPES = {
 # Environment variable naming the PLM type 'auto' part creation starts with.
 # "3DShape" skips the 3D Part attempt entirely (sites without the role).
 DEFAULT_PLM_TYPE_ENV = "CATIA_MCP_DEFAULT_PLM_TYPE"
+
+# Site-specific PLM type names (any string, e.g. a customized 3D Part type of
+# the company data model) tried by 'auto' creation before the standard types.
+PART_TYPE_ENV = "CATIA_MCP_PART_TYPE"
+PRODUCT_TYPE_ENV = "CATIA_MCP_PRODUCT_TYPE"
+
+# Keys of plm_types.json (the type that last created a part / product on
+# this machine).
+PART_KIND = "part"
+PRODUCT_KIND = "product"
+
+# Kernel type names GetCustomType may answer for uncustomized content. They
+# are not site types: a VPMReference creates a Physical Product, not a part.
+_BASE_TYPES = frozenset(
+    name.lower()
+    for name in (
+        "VPMReference", "VPMRepReference", "VPMInstance", "VPMRepInstance",
+        "PLMEntity", "PLMCoreReference", "PLMCoreRepReference", "PLMReference",
+        "3DPart", "3DShape", "Drawing",
+    )
+)
+# Product structure children read per open product during type discovery.
+_DISCOVERY_CHILDREN = 25
+
+# Uncached PLMCreate attempts one 'auto' creation may make before it stops
+# trying candidates (each refusal shows the user a modal licence dialog; the
+# pre-discovery behaviour was at most one, for 3DPart). Candidates left over
+# are tried by later 'auto' calls, since refused ones are cached on disk.
+MAX_AUTO_ATTEMPTS = 2
+
+# Accepted shape of a PLM type name passed by an agent or an environment
+# variable (typed InvalidArgument instead of a CATIA licence dialog).
+_TYPE_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.:")
+
+SHAPE_DRAWING_WARNING = (
+    "Warning: a standalone 3D Shape cannot be put on a drawing or into an "
+    "assembly; to draw it, the geometry must live in a 3D Part "
+    "(catia_drawing_add_view refuses a 3D Shape): ask the user to open any 3D "
+    "Part they made in the CATIA "
+    "UI (or create one there) and retry catia_new_part, which then learns the "
+    "site's 3D Part type from it, or rebuild the geometry inside that 3D Part."
+)
 
 # Attribute set on the CATIAConnection (connection.py is not owned here) that
 # remembers PLMCreate refusals: (app object, {plm_type: refusal text}). The
@@ -163,6 +218,155 @@ def persist_refusal(plm_type: str, reason: str | None) -> None:
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except OSError:
         pass
+
+
+def _types_file() -> Any:
+    from catia_mcp.paths import state_dir
+
+    return state_dir() / "plm_types.json"
+
+
+def load_working_types() -> dict[str, str]:
+    """{'part' | 'product': PLM type that last created one on this machine}."""
+    import json
+
+    try:
+        data = json.loads(_types_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        kind: str(entry["type"])
+        for kind, entry in data.items()
+        if isinstance(entry, dict) and entry.get("type")
+    }
+
+
+def persist_working_type(kind: str, plm_type: str | None) -> None:
+    """Remember (plm_type) or forget (None) the working type of a kind; best effort."""
+    import json
+    import time
+
+    try:
+        path = _types_file()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if plm_type is None:
+            if data.pop(kind, None) is None:
+                return
+        else:
+            data[kind] = {"type": plm_type, "at": time.time()}
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+_NOT_PART_KEY = "not_part_types"
+
+
+def load_not_part_types() -> list[str]:
+    """Types whose PLMCreate made something without a 3D Shape on this machine."""
+    import json
+
+    try:
+        data = json.loads(_types_file().read_text(encoding="utf-8"))
+        return [str(t) for t in data.get(_NOT_PART_KEY, {}).get("types", [])]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def _store_not_part_types(types: list[str]) -> None:
+    import json
+
+    try:
+        path = _types_file()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if types:
+            data[_NOT_PART_KEY] = {"types": types}
+        elif data.pop(_NOT_PART_KEY, None) is None:
+            return
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def remember_not_part_type(plm_type: str) -> None:
+    types = load_not_part_types()
+    if plm_type not in types:
+        _store_not_part_types([*types, plm_type])
+
+
+def forget_not_part_type(plm_type: str) -> None:
+    types = load_not_part_types()
+    if plm_type in types:
+        _store_not_part_types([t for t in types if t != plm_type])
+
+
+def _add_type(entries: list[dict[str, str]], plm_type: str | None, source: str) -> None:
+    """Append a discovered site type (not a kernel name, not a duplicate)."""
+    if not plm_type or is_base_type(plm_type):
+        return
+    if plm_type.lower() in {e["type"].lower() for e in entries}:
+        return
+    entries.append({"type": plm_type, "source": source})
+
+
+OPEN_UI_PART_HINT = (
+    "If the user can create 3D Parts in the CATIA UI, ask them to open any 3D Part "
+    "they made there (or create one), then retry catia_new_part: the tool learns "
+    "the site's part type from it. Or set CATIA_MCP_PART_TYPE to the type name."
+)
+OPEN_UI_PRODUCT_HINT = (
+    "If the user can create Physical Products in the CATIA UI, ask them to open any "
+    "Physical Product they made there, then retry catia_new_product: the tool learns "
+    "the site's product type from it. Or open an existing product with "
+    "catia_open_from_database."
+)
+
+
+def custom_type_of(obj: Any) -> str | None:
+    """PLM type of a reference / representation via PLMEntity.GetCustomType.
+
+    GetCustomType is listed on PLMEntity in the 3DEXPERIENCE automation
+    reference but is NOT verified on R428 SP6 (scripts/probe_3dx.py records
+    what it answers). Any failure reads as "unknown". Attribute values such
+    as V_usage or the PLM_ExternalID prefix are deliberately NOT used: they
+    are not type names PLMCreate accepts."""
+    if obj is None:
+        return None
+    try:
+        value = get_member(obj, "GetCustomType")
+    except Exception:
+        return None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def is_base_type(plm_type: str | None) -> bool:
+    return bool(plm_type) and str(plm_type).strip().lower() in _BASE_TYPES
+
+
+def check_type_name(value: str, source: str) -> str:
+    """A PLM type name as given (trimmed), or InvalidArgument before CATIA is asked."""
+    text = (value or "").strip()
+    if not text or len(text) > 100 or any(c not in _TYPE_NAME_CHARS for c in text):
+        raise InvalidArgument(
+            f"{source}={value!r} is not a PLM type name (letters, digits, '_', '-', "
+            "'.', ':'; e.g. '3DPart' or your site's customized type)."
+        )
+    return text
 
 
 def refusal_summary(error: Exception) -> str:
@@ -322,60 +526,363 @@ class PLMSession:
             editor = self.conn.active_editor
         return editor
 
-    def create_part(self, plm_type: str = "auto") -> tuple[str, str]:
-        """Create a part-like object ('auto', '3DPart' or '3DShape') and
-        return (created type, note explaining any fallback).
+    # ── Type discovery (site-customized PLM types) ──
+    #
+    # Field context (2026-11-02 field report, R428 SP6): PLMCreate("3DPart")
+    # and ("VPMReference") failed with "PLMCreate failed" / "Unspecified
+    # error" although the same user creates 3D Parts and Physical Products in
+    # the UI. Leading hypothesis (UNVERIFIED): the company data model uses
+    # customized types (specializations of VPMReference / 3D Shape) and the UI
+    # creates those while scripts asked for the base type. Discovery reads the
+    # type of content the user already made in the UI (GetCustomType, itself
+    # unverified on R428) so 'auto' creation can ask for that type instead.
 
-        'auto' starts with CATIA_MCP_DEFAULT_PLM_TYPE when set, skips a type
-        this connection already saw refused, and falls back from 3D Part to
-        3D Shape on a refusal. An explicit type is always attempted (the
-        refusal may have been lifted) and never falls back."""
+    def root_occurrence_of(self, editor: Any) -> Any | None:
+        """Root occurrence of an editor, or None (standalone 3D Shape, drawing).
+
+        Field-proven on R428 SP6 (2026-11-02 field report):
+        Editor.GetService("PLMProductService").RootOccurrence."""
+        try:
+            root = editor.GetService("PLMProductService").RootOccurrence
+        except Exception:
+            root = None
+        if root is None:
+            obj = safe_get(editor, "ActiveObject")
+            if obj is not None and resolves(obj, "ReferenceRootOccurrenceOf"):
+                root = obj
+        return root
+
+    def root_reference(self, editor: Any | None = None) -> Any | None:
+        """Root VPMReference (the 3D Part / Physical Product itself) of an
+        editor, or None. Field-proven on R428 SP6 (2026-11-02 field report):
+        ActiveEditor.GetService("PLMProductService").RootOccurrence
+        .ReferenceRootOccurrenceOf."""
+        if editor is None:
+            editor = self.conn.active_editor
+        root = self.root_occurrence_of(editor)
+        if root is None:
+            return None
+        try:
+            reference = get_member(root, "ReferenceRootOccurrenceOf")
+        except Exception:
+            return None
+        if reference is None or not resolves(reference, "GetAttributeValue"):
+            return None
+        return reference
+
+    def label_of(self, obj: Any) -> str:
+        """V_Name, else PLM_ExternalID, else Name of a PLM object."""
+        for name in ("V_Name", "PLM_ExternalID"):
+            value = self.attribute(obj, name)
+            if value:
+                return str(value)
+        return str(safe_get(obj, "Name", "<unnamed>"))
+
+    def _note_reference(
+        self, reference: Any, via: str, found: dict[str, list[dict[str, str]]], sources: list[dict[str, Any]]
+    ) -> None:
+        title = self.label_of(reference)
+        part = self.conn.part_from_reference(reference)
+        custom = custom_type_of(reference)
+        row: dict[str, Any] = {
+            "title": title,
+            "via": via,
+            "kind": "3D Part" if part is not None else "Physical Product",
+            "custom_type": custom,
+        }
+        if part is not None:
+            rep_type = custom_type_of(safe_get(part, "Parent"))
+            row["shape_custom_type"] = rep_type
+            _add_type(found["shape"], rep_type, title)
+        _add_type(found[PART_KIND if part is not None else PRODUCT_KIND], custom, title)
+        sources.append(row)
+
+    def discover_types(self) -> dict[str, Any]:
+        """Customized PLM types of the content open in this session.
+
+        Every open editor is visited: a root reference with a 3D Shape
+        representation is a 3D Part, one without is a Physical Product (its
+        first-level components are visited too); a standalone 3D Shape gives
+        a shape type. Kernel names (VPMReference, 3DPart, ...) are not site
+        types and are left out of the candidate lists. Read-only."""
+        found: dict[str, list[dict[str, str]]] = {PART_KIND: [], PRODUCT_KIND: [], "shape": []}
+        sources: list[dict[str, Any]] = []
+        for editor in self.editors():
+            obj = safe_get(editor, "ActiveObject")
+            if obj is None or resolves(obj, "Sheets"):
+                continue
+            root = self.root_occurrence_of(editor)
+            reference = self.root_reference(editor) if root is not None else None
+            if reference is None:
+                if resolves(obj, "ShapeFactory"):
+                    rep = safe_get(obj, "Parent")
+                    title = self.label_of(rep) if rep is not None else com_name(obj)
+                    rep_type = custom_type_of(rep)
+                    sources.append(
+                        {"title": title, "via": "open editor", "kind": "3D Shape", "shape_custom_type": rep_type}
+                    )
+                    _add_type(found["shape"], rep_type, title)
+                continue
+            self._note_reference(reference, "open editor", found, sources)
+            parent = self.label_of(reference)
+            for child in self.child_occurrences(root)[:_DISCOVERY_CHILDREN]:
+                child_reference = self.reference_of(child)
+                if child_reference is not None:
+                    self._note_reference(child_reference, f"component of '{parent}'", found, sources)
+        return {**found, "sources": sources}
+
+    def _candidates(
+        self, kind: str, standard: str, env_name: str, discovered: list[dict[str, str]], late: list[dict[str, str]]
+    ) -> list[tuple[str, str]]:
+        """(type, origin) in the order 'auto' creation tries them:
+        remembered working type -> env type -> discovered types -> standard
+        type -> `late` (ambiguous discovered types)."""
+        out: list[tuple[str, str]] = []
+
+        def add(plm_type: str | None, origin: str) -> None:
+            if plm_type and plm_type.lower() not in {t.lower() for t, _ in out}:
+                out.append((plm_type, origin))
+
+        add(load_working_types().get(kind), f"it created a {kind} on this machine before")
+        raw = os.environ.get(env_name)
+        if raw and raw.strip():
+            add(check_type_name(raw, env_name), f"set by {env_name}")
+        for entry in discovered:
+            add(entry["type"], f"type of '{entry['source']}' open in this session")
+        add(standard, "standard type")
+        for entry in late:
+            add(entry["type"], f"type of '{entry['source']}' open in this session")
+        return out
+
+    def _part_type_failed(self, plm_type: str) -> None:
+        if load_working_types().get(PART_KIND, "").lower() == plm_type.lower():
+            persist_working_type(PART_KIND, None)
+
+    def _after_part_created(self, plm_type: str, origin: str) -> str:
+        """Verify a non-3DShape creation produced a part, remember the type."""
+        if plm_type == "3DShape":
+            return SHAPE_DRAWING_WARNING
+        try:
+            self.conn.get_active_part()
+        except CATIAToolError as error:
+            # CATIA did not refuse, so this is not a licence refusal: mark the
+            # type as "not a part type" (a product type may share it).
+            remember_not_part_type(plm_type)
+            self._part_type_failed(plm_type)
+            raise UnsupportedCapability(
+                f"PLMCreate('{plm_type}') ({origin}) ran, but the new editor shows no 3D "
+                f"Shape ({error}). The new object is open, unsaved, in the session: close "
+                f"it with catia_close_document. '{plm_type}' will not be used for parts "
+                "again; pass plm_type explicitly to override.",
+                modified=True,
+            ) from error
+        persist_working_type(PART_KIND, plm_type)
+        if plm_type == "3DPart":
+            return ""
+        return (
+            f"Created with the site's PLM type '{plm_type}' ({origin}); remembered on "
+            "this machine for later catia_new_part calls."
+        )
+
+    def create_part(self, plm_type: str = "auto", *, shape_fallback: bool = True) -> tuple[str, str]:
+        """Create a part and return (created type, note).
+
+        plm_type: 'auto', '3DPart', '3DShape' or a site type name. An explicit
+        type is always attempted (a refusal may have been lifted) and never
+        falls back. 'auto' tries, skipping every type refused on this machine
+        (each refused attempt costs the user a modal licence dialog):
+        remembered working type -> CATIA_MCP_PART_TYPE -> customized types of
+        3D Parts open in the session -> '3DPart' -> '3DShape' (only with
+        shape_fallback; never skipped). CATIA_MCP_DEFAULT_PLM_TYPE=3DShape
+        goes straight to 3DShape."""
         if plm_type != "auto":
-            self.create(plm_type)
-            return plm_type, ""
-        default = default_part_type()
-        attempts = ["3DShape"] if default == "3DShape" else ["3DPart", "3DShape"]
-        notes: list[str] = []
-        if default == "3DShape":
-            notes.append(
-                f"{DEFAULT_PLM_TYPE_ENV}=3DShape, so no 3D Part was attempted; a 3D "
-                "Shape has no product node of its own."
-            )
-        refusals: list[str] = []
-        for kind in list(attempts):
-            cached = self.refused(kind)
-            if cached is not None and kind != attempts[-1]:
-                notes.append(
-                    f"A {kind} was refused earlier on this machine ({cached}), so a "
-                    f"{attempts[-1]} was created directly (no licence dialog); it has no "
-                    f"product node of its own. Pass plm_type='{kind}' to try again."
+            kind = normalize_create_type(plm_type) or check_type_name(plm_type, "plm_type")
+            if kind in ("Drawing", "VPMReference"):
+                raise InvalidArgument(
+                    f"plm_type '{plm_type}' does not create a part; use catia_new_drawing or "
+                    "catia_new_product."
                 )
+            try:
+                self.create(kind)
+            except PLMCreateRefused as refusal:
+                raise UnsupportedCapability(
+                    f"{refusal} {OPEN_UI_PART_HINT}", modified=refusal.modified
+                ) from refusal
+            if kind != "3DShape":
+                forget_not_part_type(kind)
+            return kind, self._after_part_created(kind, "requested explicitly")
+        if default_part_type() == "3DShape":
+            candidates: list[tuple[str, str]] = []
+            notes = [f"{DEFAULT_PLM_TYPE_ENV}=3DShape, so no 3D Part was attempted."]
+        else:
+            discovery = self.discover_types()
+            not_part = {t.lower() for t in load_not_part_types()}
+            product_types = {e["type"].lower() for e in discovery[PRODUCT_KIND]}
+            usable = [e for e in discovery[PART_KIND] if e["type"].lower() not in not_part]
+            # A type also seen on a Physical Product is probably a VPMReference
+            # specialization that creates a product, not a part: try it last.
+            early = [e for e in usable if e["type"].lower() not in product_types]
+            late = [e for e in usable if e["type"].lower() in product_types]
+            candidates = self._candidates(PART_KIND, "3DPart", PART_TYPE_ENV, early, late)
+            notes = []
+        final = "3DShape" if shape_fallback else None
+        skipped: list[tuple[str, str]] = []
+        failures: list[str] = []
+        deferred: list[str] = []
+        modified: bool | None = False  # whether a failed attempt may have created something
+        for kind, origin in candidates:
+            if final is not None and kind.lower() == final.lower():
+                continue
+            cached = self.refused(kind)
+            if cached is not None:
+                skipped.append((kind, cached))
+                continue
+            if len(failures) >= MAX_AUTO_ATTEMPTS:
+                deferred.append(kind)
                 continue
             try:
                 self.create(kind)
-            except Exception as error:  # 'auto' falls back on any failure
+            except Exception as error:  # 'auto' moves on after any failure
                 reason = error.reason if isinstance(error, PLMCreateRefused) else refusal_summary(error)
-                refusals.append(f"{kind}: {reason}")
-                if kind != attempts[-1]:
-                    # Whatever the wording, a failed attempt cost the user a
-                    # dialog; do not try it again on the next 'auto' create.
-                    self.remember_refusal(kind, reason)
-                if kind == attempts[-1]:
-                    raise UnsupportedCapability(
-                        "3DEXPERIENCE refused to create the part ("
-                        + "; ".join(refusals)
-                        + "). Check that you are logged in, have a collaborative space "
-                        "selected, and hold a role allowing creation.",
-                        modified=getattr(error, "modified", None),
-                    ) from error
-                later = f" Later 'auto' creations go straight to {attempts[-1]}."
-                notes.append(
-                    f"A {kind} could not be created ({reason}), so a {attempts[-1]} was "
-                    f"created instead; it has no product node of its own.{later}"
-                )
+                failures.append(f"{kind} ({origin}): {reason}")
+                # Whatever the wording, a failed attempt cost the user a
+                # dialog; do not try it again on the next 'auto' create.
+                self.remember_refusal(kind, reason)
+                self._part_type_failed(kind)
+                if getattr(error, "modified", None) is not False:
+                    modified = None
                 continue
+            note = self._after_part_created(kind, origin)
+            if failures:
+                notes.append(
+                    "Refused first (not tried again by 'auto'): " + "; ".join(failures) + "."
+                )
+            return kind, " ".join(n for n in [*notes, note] if n)
+        deferred_note = (
+            f" Not tried in this call (at most {MAX_AUTO_ATTEMPTS} licence dialogs per "
+            "call): " + ", ".join(deferred) + "; a later 'auto' call tries them."
+            if deferred
+            else ""
+        )
+        if final is None:
+            if failures:
+                raise UnsupportedCapability(
+                    "3DEXPERIENCE refused to create a 3D Part (" + "; ".join(failures) + ")."
+                    + deferred_note + " " + OPEN_UI_PART_HINT,
+                    modified=modified,
+                )
+            raise UnsupportedCapability(
+                "3DEXPERIENCE refused to create a 3D Part earlier on this machine ("
+                + ("; ".join(f"{k}: {r}" for k, r in skipped) or "no part type available")
+                + "); not retried, to avoid another licence dialog. "
+                + OPEN_UI_PART_HINT,
+                modified=False,
+            )
+        try:
+            self.create(final)
+        except Exception as error:
+            reason = error.reason if isinstance(error, PLMCreateRefused) else refusal_summary(error)
+            raise UnsupportedCapability(
+                "3DEXPERIENCE refused to create the part ("
+                + "; ".join([*failures, *(f"{k}: {r}" for k, r in skipped), f"{final}: {reason}"])
+                + "). Check that you are logged in, have a collaborative space "
+                "selected, and hold a role allowing creation.",
+                modified=getattr(error, "modified", None),
+            ) from error
+        for kind, cached in skipped:
+            notes.append(
+                f"A {kind} was refused earlier on this machine ({cached}), "
+                f"so it was not tried again (no licence dialog). Pass plm_type='{kind}' to "
+                "try again."
+            )
+        if failures:
+            notes.append(
+                "Could not create " + "; ".join(failures) + f", so a {final} was created "
+                "instead. Later 'auto' creations skip the refused types."
+            )
+        if deferred_note:
+            notes.append(deferred_note.strip())
+        notes.append(SHAPE_DRAWING_WARNING)
+        return final, " ".join(notes)
+
+    def create_product(self, plm_type: str = "auto") -> tuple[str, str]:
+        """Create a Physical Product and return (created type, note).
+
+        'auto' tries, skipping types refused on this machine: remembered
+        working product type -> CATIA_MCP_PRODUCT_TYPE -> customized types of
+        Physical Products open in the session -> 'VPMReference'. Discovery
+        and custom types are UNVERIFIED on R428 (see discover_types)."""
+        if plm_type != "auto":
+            kind = normalize_create_type(plm_type) or check_type_name(plm_type, "plm_type")
+            if kind in ("3DPart", "3DShape", "Drawing"):
+                raise InvalidArgument(
+                    f"plm_type '{plm_type}' does not create a Physical Product; use "
+                    "catia_new_part or catia_new_drawing."
+                )
+            try:
+                self.create(kind)
+            except PLMCreateRefused as refusal:
+                raise UnsupportedCapability(
+                    f"{refusal} {OPEN_UI_PRODUCT_HINT}", modified=refusal.modified
+                ) from refusal
+            persist_working_type(PRODUCT_KIND, kind)
+            return kind, ""
+        discovery = self.discover_types()
+        candidates = self._candidates(
+            PRODUCT_KIND, "VPMReference", PRODUCT_TYPE_ENV, discovery[PRODUCT_KIND], []
+        )
+        skipped: list[str] = []
+        failures: list[str] = []
+        deferred: list[str] = []
+        modified: bool | None = False
+        for kind, origin in candidates:
+            cached = self.refused(kind)
+            if cached is not None:
+                skipped.append(f"{kind}: {cached}")
+                continue
+            if len(failures) >= MAX_AUTO_ATTEMPTS:
+                deferred.append(kind)  # bounded licence dialogs per call
+                continue
+            try:
+                self.create(kind)
+            except Exception as error:
+                reason = error.reason if isinstance(error, PLMCreateRefused) else refusal_summary(error)
+                failures.append(f"{kind} ({origin}): {reason}")
+                self.remember_refusal(kind, reason)
+                if load_working_types().get(PRODUCT_KIND, "").lower() == kind.lower():
+                    persist_working_type(PRODUCT_KIND, None)
+                if getattr(error, "modified", None) is not False:
+                    modified = None
+                continue
+            persist_working_type(PRODUCT_KIND, kind)
+            notes = []
+            if kind != "VPMReference":
+                notes.append(
+                    f"Created with the site's PLM type '{kind}' ({origin}); remembered on "
+                    "this machine for later catia_new_product calls."
+                )
+            if failures:
+                notes.append("Refused first (not tried again by 'auto'): " + "; ".join(failures) + ".")
             return kind, " ".join(notes)
-        raise AssertionError("unreachable")  # pragma: no cover
+        if failures:
+            later = (
+                f" Not tried in this call (at most {MAX_AUTO_ATTEMPTS} licence dialogs per "
+                "call): " + ", ".join(deferred) + "; a later call tries them."
+                if deferred
+                else ""
+            )
+            raise UnsupportedCapability(
+                "3DEXPERIENCE refused to create a Physical Product (" + "; ".join(failures)
+                + ")." + later + " " + OPEN_UI_PRODUCT_HINT,
+                modified=modified,
+            )
+        raise UnsupportedCapability(
+            "3DEXPERIENCE refused to create a Physical Product earlier on this machine ("
+            + "; ".join(skipped)
+            + "); not retried, to avoid another licence dialog. "
+            + OPEN_UI_PRODUCT_HINT,
+            modified=False,
+        )
 
     def open_entity(self, entity: Any) -> Any:
         service = self.conn.session_service("PLMOpenService")

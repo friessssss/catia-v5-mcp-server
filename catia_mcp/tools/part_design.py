@@ -16,7 +16,7 @@ import json
 import math
 from typing import Any
 
-from catia_mcp.automation import iter_items, name_exists
+from catia_mcp.automation import call_fill_array, com_name, iter_items, name_exists
 from catia_mcp.connection import CATIAConnection
 from catia_mcp.errors import CATIAToolError, InvalidArgument, ObjectNotFound, UnsupportedCapability
 from catia_mcp.introspect import type_name
@@ -28,7 +28,29 @@ from catia_mcp.references import (
     search_final_topology,
     topology_index,
     topology_reference,
+    topology_references,
 )
+
+# CatHoleThreadStandard codes for Hole.CreateStandardThreadDesignTable.
+# 1 = metric coarse (thick pitch) is field-proven on R428 SP6 (2026-11-02
+# field report: CreateStandardThreadDesignTable(1) + "M6" gave M6x1.0 with
+# the 4.917 mm tap drill). 0 = metric fine (thin pitch) follows the enum
+# order of the automation reference; UNC = 2 and UNF = 3 are UNVERIFIED
+# guesses. The designation read-back catches a wrong table.
+_THREAD_STANDARDS = {
+    "metric_coarse": 1,
+    "metric_fine": 0,
+    "unc": 2,
+    "unf": 3,
+}
+
+# CatHoleThreadingMode (B30 type libraries): threaded = 0, smooth = 1.
+_THREADED = 0
+_SMOOTH = 1
+
+# CatLimitMode: catUpToLastLimit = 2 (bottom limit "up to last"). UNVERIFIED
+# live for holes.
+_UP_TO_LAST = 2
 
 
 def _set_prop(obj: Any, name: str, value: Any) -> bool:
@@ -272,18 +294,37 @@ class PartDesignTools:
                     "The depth is set on the hole's bottom limit and read back; the "
                     "removed volume is measured and reported. A hole that removes "
                     "nothing is reversed once; if it still removes nothing the call "
-                    "fails with FEATURE_NO_EFFECT (the hole stays in the tree)."
+                    "fails with FEATURE_NO_EFFECT (the hole stays in the tree). "
+                    "Threaded holes use a standard thread table: with thread_standard "
+                    "metric_coarse and designation 'M6', CATIA sets the tap drill "
+                    "itself (diameter becomes 4.917 mm); the resulting diameter and "
+                    "thread values are read back and reported. A smooth hole has any "
+                    "thread settings CATIA carried over from the previous hole reset. "
+                    "If CATIA rejects the hole, it is removed; CATIA deletes the "
+                    "input sketch with it, so the error lists the sketch's points to "
+                    "recreate it."
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "diameter": {
                             "type": "number",
-                            "description": "Hole diameter in mm",
+                            "description": (
+                                "Hole diameter in mm. For a standard thread, the nominal "
+                                "diameter (6 for M6); CATIA replaces it with the tap drill."
+                            ),
                         },
                         "depth": {
                             "type": "number",
-                            "description": "Hole depth in mm",
+                            "description": "Hole depth in mm. Optional when through_all is true.",
+                        },
+                        "through_all": {
+                            "type": "boolean",
+                            "description": (
+                                "Drill through the whole solid (bottom limit 'up to last') "
+                                "instead of to 'depth'. Default false."
+                            ),
+                            "default": False,
                         },
                         "type": {
                             "type": "string",
@@ -293,15 +334,42 @@ class PartDesignTools:
                         },
                         "threaded": {
                             "type": "boolean",
-                            "description": "Whether to add threading (default: false)",
+                            "description": (
+                                "Whether to add threading (default: false). Implied by "
+                                "thread_standard, designation or thread_depth."
+                            ),
                             "default": False,
+                        },
+                        "thread_standard": {
+                            "type": "string",
+                            "enum": list(_THREAD_STANDARDS),
+                            "description": (
+                                "Thread table for a threaded hole (default metric_coarse). "
+                                "metric_coarse is field-proven on 3DEXPERIENCE R428; the "
+                                "others are unverified."
+                            ),
+                        },
+                        "designation": {
+                            "type": "string",
+                            "description": (
+                                "Thread designation from the table, e.g. 'M6'. Default for "
+                                "metric_coarse: 'M' + diameter. Required for metric_fine "
+                                "(e.g. 'M8x1'), unc and unf."
+                            ),
+                        },
+                        "thread_depth": {
+                            "type": "number",
+                            "description": (
+                                "Thread depth in mm (default: the hole depth). Must not "
+                                "exceed the hole depth."
+                            ),
                         },
                         "sketch_name": {
                             "type": "string",
                             "description": "Sketch containing the hole center point",
                         },
                     },
-                    "required": ["diameter", "depth"],
+                    "required": ["diameter"],
                 },
             },
             {
@@ -541,8 +609,10 @@ class PartDesignTools:
                 "name": "catia_list_edges",
                 "description": (
                     "List the edges of the final solid shape as indexed names "
-                    "(Edge.N). These indices feed catia_measure_distance; for "
-                    "fillet/chamfer targeting see each tool's own contract."
+                    "(Edge.N). These indices feed catia_measure_distance and "
+                    "catia_fillet (same enumeration: on 3DEXPERIENCE the solid "
+                    "edges of the last feature, e.g. 12 for a padded box); for "
+                    "chamfer targeting see its own contract."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1157,26 +1227,32 @@ class PartDesignTools:
                 return
             except Exception as e:
                 error = e
-        try:
-            name = str(feature.Name)
-        except Exception:
-            name = "the feature"
+        self._raise_update_failed(feature, error)
+
+    def _remove_feature(self, feature: Any) -> bool:
+        """Delete one feature through the selection; True when it went."""
         selection = None
         try:
             selection = self.conn.hso
             selection.Clear()
             selection.Add(feature)
             selection.Delete()
-            removed = True
+            return True
         except Exception:
-            removed = False
+            return False
         finally:
             if selection is not None:
                 try:
                     selection.Clear()
                 except Exception:
                     pass
-        if removed:
+
+    def _raise_update_failed(self, feature: Any, error: Exception) -> None:
+        try:
+            name = str(feature.Name)
+        except Exception:
+            name = "the feature"
+        if self._remove_feature(feature):
             outcome = (
                 "it was removed from the tree, so no broken feature is left behind. "
                 "Check the inputs (edge/face choice, sizes, profile) and retry."
@@ -1210,6 +1286,14 @@ class PartDesignTools:
         sf = part.ShapeFactory
 
         edge_name = args.get("edge_name")
+        if self.conn.is_3dx:
+            edge_refs = self._fillet_edges_3dx(edge_name)
+            if edge_refs:
+                return self._fillet_3dx(part, sf, radius, edge_refs, edge_name)
+            # No edge cell found at all: fall back to the whole-feature
+            # reference below. It failed live on R428 SP6 (2026-11-02 field
+            # report), so expect CATIA's own error; it is kept because it is
+            # the only remaining route and nothing has been created yet.
         if edge_name:
             target = self._topo_reference("Edge", self._topo_index(edge_name, "Edge"))
             scope = edge_name
@@ -1229,6 +1313,47 @@ class PartDesignTools:
         # broken fillet is removed instead of poisoning every later feature.
         self._safe_update(part, fillet)
         self.conn.refresh_display()
+        return f"Fillet created: R{radius} mm on {scope}. Feature: '{fillet.Name}'"
+
+    def _fillet_edges_3dx(self, edge_name: str | None) -> list[Any]:
+        """Edge References for a 3DEXPERIENCE fillet, from the same topology
+        search catia_list_edges enumerates (references.search_final_topology).
+
+        Live on R428 SP6 (2026-11-02 field report), both the whole-feature
+        reference (CreateReferenceFromObject(Pad)) and the old Edge.1 (from a
+        body search that also returned sketch edges) made
+        AddNewSolidEdgeFilletWithConstantRadius fail. Empty list: the search
+        found no edge at all. A failing (non-probe) search propagates its COM
+        error: nothing has been created yet.
+        """
+        if edge_name:
+            index = self._topo_index(edge_name, "Edge")
+            return [topology_reference(self.conn, "Edge", index)]
+        return topology_references(self.conn, "Edge")
+
+    def _fillet_3dx(
+        self, part: Any, sf: Any, radius: float, refs: list[Any], edge_name: str | None
+    ) -> str:
+        """Field-proven on R428 SP6 (2026-11-02 field report): create the
+        fillet on the first topology-search edge with tangency propagation
+        (1 = catTangencyFilletEdgePropagation), add every other edge with
+        AddObjectToFillet, then update."""
+        fillet = sf.AddNewSolidEdgeFilletWithConstantRadius(refs[0], 1, radius)
+        added = 1
+        try:
+            for ref in refs[1:]:
+                fillet.AddObjectToFillet(ref)
+                added += 1
+        except Exception as error:
+            # The fillet exists but holds only some edges: remove it rather
+            # than leave a partial, un-updated feature in the tree.
+            self._raise_update_failed(
+                fillet,
+                RuntimeError(f"AddObjectToFillet refused edge {added + 1} of {len(refs)}: {error}"),
+            )
+        self._safe_update(part, fillet)
+        self.conn.refresh_display()
+        scope = edge_name if edge_name else f"all {len(refs)} edges of the last feature"
         return f"Fillet created: R{radius} mm on {scope}. Feature: '{fillet.Name}'"
 
     def _chamfer(self, args: dict[str, Any]) -> str:
@@ -1270,11 +1395,138 @@ class PartDesignTools:
     # an unchanged solid, far below what any hole entering the solid removes.
     _HOLE_NO_EFFECT_FRACTION = 1e-3
 
+    def _hole_thread_args(self, args: dict[str, Any], diameter: float, depth: float | None,
+                          through_all: bool) -> dict[str, Any] | None:
+        """Validate the thread options before any CATIA call; None = smooth."""
+        standard = args.get("thread_standard")
+        designation = args.get("designation")
+        thread_depth = args.get("thread_depth")
+        threaded = bool(args.get("threaded", False)) or any(
+            v is not None for v in (standard, designation, thread_depth)
+        )
+        if not threaded:
+            return None
+        standard = standard or "metric_coarse"
+        if standard not in _THREAD_STANDARDS:
+            raise InvalidArgument(
+                f"Unknown thread_standard '{standard}'. Use one of: {', '.join(_THREAD_STANDARDS)}."
+            )
+        if designation is None:
+            # "M<d>" is a coarse-table name; a fine table lists "M8x1" etc.
+            if standard != "metric_coarse":
+                raise InvalidArgument(
+                    f"thread_standard '{standard}' needs a 'designation' as listed in "
+                    "CATIA's thread table (e.g. 'M8x1' for metric_fine, '1/4-20' for unc)."
+                )
+            designation = f"M{diameter:g}"
+        designation = str(designation).strip()
+        if not designation:
+            raise InvalidArgument("designation must not be empty.")
+        if thread_depth is None:
+            if depth is None:
+                raise InvalidArgument(
+                    "A through-all threaded hole needs 'thread_depth' (or 'depth')."
+                )
+            thread_depth = depth
+        if not thread_depth > 0:
+            raise InvalidArgument("thread_depth must be positive (mm).")
+        if depth is not None and not through_all and thread_depth > depth + 1e-9:
+            raise InvalidArgument(
+                f"thread_depth {thread_depth:g} mm exceeds the hole depth {depth:g} mm."
+            )
+        return {
+            "standard": standard,
+            "code": _THREAD_STANDARDS[standard],
+            "designation": designation,
+            "depth": float(thread_depth),
+        }
+
+    _SNAPSHOT_POINTS = 20
+
+    def _sketch_snapshot(self, sketch: Any) -> dict[str, Any]:
+        """Name, axis system and points of a hole's input sketch, captured
+        before AddNewHoleFromSketch absorbs it. Deleting a rejected hole
+        deletes that sketch with it (2026-11-02 field report: the rollback
+        removed hole and sketch, the retry got OBJECT_NOT_FOUND), so the
+        failure message carries what is needed to recreate it.
+
+        Point2D.GetCoordinates and Sketch.GetAbsoluteAxisData are SAFEARRAY
+        out-parameter methods (read through SystemService.Evaluate, see
+        automation.call_fill_array). UNVERIFIED live on these two methods;
+        anything unreadable is simply left out.
+        """
+        snapshot: dict[str, Any] = {"name": None, "points": [], "axis": None}
+        try:
+            snapshot["name"] = str(sketch.Name)
+        except Exception:
+            pass
+        app = getattr(self.conn, "app", None)
+        try:
+            snapshot["axis"] = call_fill_array(app, sketch, "GetAbsoluteAxisData", 9)
+        except Exception:
+            pass
+        try:
+            elements = list(iter_items(sketch.GeometricElements))
+        except Exception:
+            elements = []
+        # Only elements that expose GetCoordinates (Point2D) go through
+        # Evaluate: no script is run that is known to fail (axis, lines),
+        # and a large sketch costs at most _SNAPSHOT_POINTS calls.
+        for element in elements:
+            if len(snapshot["points"]) >= self._SNAPSHOT_POINTS:
+                break
+            if com_name(element, "") == "AbsoluteAxis" or not name_exists(element, "GetCoordinates"):
+                continue
+            try:
+                snapshot["points"].append(tuple(call_fill_array(app, element, "GetCoordinates", 2)))
+            except Exception:
+                pass
+        return snapshot
+
+    def _sketch_note(self, snapshot: dict[str, Any], body: Any) -> str:
+        """What happened to the hole's input sketch after the hole was removed."""
+        name = snapshot.get("name")
+        if not name:
+            return ""
+        try:
+            body.Sketches.Item(name)
+            return f"Its input sketch '{name}' was kept; retry with sketch_name='{name}'."
+        except Exception:
+            pass
+        note = (
+            f"CATIA deleted its input sketch '{name}' with it (a hole absorbs its "
+            "sketch); recreate it with catia_create_sketch and catia_sketch_point"
+        )
+        points = snapshot.get("points") or []
+        if not points:
+            return note + " (its point coordinates could not be read)."
+        axis = snapshot.get("axis")
+        described = []
+        for x, y in points:
+            text = f"({x:g}, {y:g})"
+            if axis:
+                o, h, v = axis[0:3], axis[3:6], axis[6:9]
+                xyz = [o[i] + x * h[i] + y * v[i] for i in range(3)]
+                text += " = 3D ({:g}, {:g}, {:g})".format(*xyz)
+            described.append(text)
+        where = ""
+        if axis:
+            where = (
+                " on the plane with origin ({:g}, {:g}, {:g}), H ({:g}, {:g}, {:g}), "
+                "V ({:g}, {:g}, {:g})".format(*axis)
+            )
+        return f"{note}{where}: sketch point(s) {', '.join(described)} mm."
+
     def _hole(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
         diameter = args["diameter"]
-        depth = args["depth"]
-        if diameter <= 0 or depth <= 0:
+        depth = args.get("depth")
+        through_all = bool(args.get("through_all", False))
+        if not diameter > 0:
+            raise InvalidArgument("diameter must be positive (mm).")
+        if depth is None and not through_all:
+            raise InvalidArgument("depth is required unless through_all is true.")
+        if depth is not None and not depth > 0:
             raise InvalidArgument("diameter and depth must be positive (mm).")
         hole_type = args.get("type", "simple")
         # CatHoleType: 0 simple, 1 tapered, 2 counterbored, 3 countersunk.
@@ -1283,11 +1535,13 @@ class PartDesignTools:
             raise InvalidArgument(
                 f"Unknown hole type '{hole_type}'. Use one of: {', '.join(type_map)}."
             )
+        thread = self._hole_thread_args(args, diameter, depth, through_all)
         part = self.conn.get_active_part()
         body = self.conn.get_active_part_body()
         sf = part.ShapeFactory
 
         sketch = self._profile_sketch(args.get("sketch_name"))
+        snapshot = self._sketch_snapshot(sketch)
         before = self._body_volume_mm3(part, body)
 
         # V5-6R2020: see _pad - the sketch's owning body must be in-work.
@@ -1295,22 +1549,48 @@ class PartDesignTools:
         # AddNewHole takes a support FACE reference; the sketch-positioned
         # form is AddNewHoleFromSketch. Diameter is a read-only Length
         # parameter object whose .Value is assigned.
-        hole = sf.AddNewHoleFromSketch(sketch, depth)
+        hole = sf.AddNewHoleFromSketch(sketch, depth if depth is not None else 10.0)
         hole.Diameter.Value = diameter
-        # 3DEXPERIENCE R428 ignores AddNewHoleFromSketch's depth (live: the
-        # bottom limit read 10 after asking for 20), so it is set on the
-        # bottom limit explicitly, as V5 recorded macros do, and read back.
-        hole.BottomLimit.Dimension.Value = depth
-        applied_depth = float(hole.BottomLimit.Dimension.Value)
-        if abs(applied_depth - depth) > 1e-6:
-            raise CATIAToolError(
-                f"Hole '{hole.Name}' kept a depth of "
-                f"{applied_depth:g} mm after {depth:g} mm was set on its bottom limit. "
-                "It remains in the tree; delete it with catia_delete_feature.",
-                code="WRONG_GEOMETRY_EFFECT",
-                modified=None,
-            )
+        if through_all:
+            # UNVERIFIED live: bottom limit "up to last" (CatLimitMode 2).
+            applied = _set_prop(hole.BottomLimit, "LimitMode", _UP_TO_LAST)
+            if applied:
+                try:
+                    applied = int(hole.BottomLimit.LimitMode) == _UP_TO_LAST
+                except Exception:
+                    pass
+            if not applied:
+                raise CATIAToolError(
+                    f"Hole '{hole.Name}' was created but CATIA rejected the 'up to last' "
+                    "bottom limit, so it is not through-all. It remains in the tree; "
+                    "delete it with catia_delete_feature, then retry with a depth.",
+                    code="WRONG_GEOMETRY_EFFECT",
+                    modified=None,
+                )
+            applied_depth = None
+        else:
+            # 3DEXPERIENCE R428 ignores AddNewHoleFromSketch's depth (live: the
+            # bottom limit read 10 after asking for 20), so it is set on the
+            # bottom limit explicitly, as V5 recorded macros do, and read back.
+            hole.BottomLimit.Dimension.Value = depth
+            applied_depth = float(hole.BottomLimit.Dimension.Value)
+            if abs(applied_depth - depth) > 1e-6:
+                raise CATIAToolError(
+                    f"Hole '{hole.Name}' kept a depth of "
+                    f"{applied_depth:g} mm after {depth:g} mm was set on its bottom limit. "
+                    "It remains in the tree; delete it with catia_delete_feature.",
+                    code="WRONG_GEOMETRY_EFFECT",
+                    modified=None,
+                )
         hole.BottomType = 0  # catFlatBottom
+
+        if thread is None:
+            # 2026-11-02 field report: a new hole inherited the previous hole's
+            # thread settings. A smooth hole is made smooth explicitly
+            # (CatHoleThreadingMode smooth = 1), before the first update so a
+            # carried-over thread cannot make that update fail. Only written
+            # when it does not already read smooth (no-op otherwise).
+            self._reset_smooth(hole)
 
         type_note = ""
         if hole_type != "simple":
@@ -1340,8 +1620,11 @@ class PartDesignTools:
 
         # One update (it used to run twice); the full part.Update() fallback
         # is the V5-6R2020 recipe, and a hole CATIA still rejects is removed.
-        self._safe_update(part, hole, full_update_fallback=True)
-        threshold = self._HOLE_NO_EFFECT_FRACTION * math.pi * diameter**2 * depth / 4.0
+        # Only the hole is put in the selection; CATIA deletes the sketch it
+        # absorbed with it, which the note reports (with the sketch points).
+        self._hole_update(part, hole, body, snapshot)
+        nominal_depth = depth if depth is not None else 1.0
+        threshold = self._HOLE_NO_EFFECT_FRACTION * math.pi * diameter**2 * nominal_depth / 4.0
         after = self._body_volume_mm3(part, body)
         reversed_note = ""
         if before is not None and after is not None and before - after <= threshold:
@@ -1361,36 +1644,157 @@ class PartDesignTools:
                     modified=None,
                 )
 
-        if args.get("threaded", False):
-            # V5-6R2020: threading a hole that has not materialized yet
-            # breaks the rebuild, so apply it AFTER the first update. B30
-            # type libraries: CatHoleThreadingMode threaded = 0 (1 = smooth).
-            if not _set_prop(hole, "ThreadingMode", 0):
-                raise CATIAToolError(
-                    f"Hole '{hole.Name}' was created but CATIA rejected the threading "
-                    "mode, so it is smooth. Retry without 'threaded' or thread it in CATIA.",
-                    code="WRONG_GEOMETRY_EFFECT",
-                    modified=None,
-                )
-            try:
-                part.Update()
-            except Exception as error:
-                raise RuntimeError(
-                    f"Hole '{hole.Name}' was threaded but the part update failed ({error}). "
-                    "Inspect the hole in CATIA before continuing."
-                ) from error
-            type_note += " Threaded."
+        if thread is not None:
+            type_note += self._apply_thread(part, hole, body, snapshot, thread)
         self.conn.refresh_display()
-        summary = (
-            f"Hole '{hole.Name}' created: D{diameter} mm, depth {applied_depth:g} mm"
-            f"{reversed_note}."
-        )
+        try:
+            final_diameter = float(hole.Diameter.Value)
+        except Exception:
+            final_diameter = float(diameter)
+        extent = "through all" if applied_depth is None else f"depth {applied_depth:g} mm"
+        summary = f"Hole '{hole.Name}' created: D{final_diameter:g} mm, {extent}{reversed_note}."
         if before is None or after is None:
             return f"{summary} Volume verification unavailable on this installation.{type_note}"
         return (
             f"{summary} Removed {before - after:.1f} mm3 ({before:.1f} -> {after:.1f})."
             f"{type_note}"
         )
+
+    def _hole_update(self, part: Any, hole: Any, body: Any, snapshot: dict[str, Any]) -> None:
+        try:
+            part.UpdateObject(hole)
+            return
+        except Exception as e:
+            error = e
+        try:
+            part.Update()
+            return
+        except Exception as e:
+            error = e
+        # Only now (after the removal) can we tell whether the sketch went too.
+        try:
+            name = str(hole.Name)
+        except Exception:
+            name = "the hole"
+        if self._remove_feature(hole):
+            outcome = (
+                "it was removed from the tree, so no broken feature is left behind. "
+                "Check the inputs (sizes, thread, sketch point) and retry. "
+                + self._sketch_note(snapshot, body)
+            ).rstrip()
+        else:
+            outcome = (
+                "it could NOT be removed automatically and remains in the tree in "
+                f"error: delete '{name}' with catia_delete_feature before continuing."
+            )
+        raise CATIAToolError(
+            f"CATIA rejected '{name}' (update failed: {error}); {outcome}",
+            code="FEATURE_UPDATE_FAILED",
+            modified=None,
+        ) from error
+
+    @staticmethod
+    def _reset_smooth(hole: Any) -> None:
+        # Fail only when CATIA positively reads "threaded" afterwards: a
+        # release whose ThreadingMode is unreadable and unwritable made plain
+        # holes before this reset existed, and must keep doing so.
+        try:
+            current: int | None = int(hole.ThreadingMode)
+        except Exception:
+            current = None
+        if current == _SMOOTH:
+            return
+        _set_prop(hole, "ThreadingMode", _SMOOTH)
+        try:
+            still_threaded = int(hole.ThreadingMode) != _SMOOTH
+        except Exception:
+            still_threaded = False
+        if still_threaded:
+            raise CATIAToolError(
+                f"Hole '{hole.Name}' was created but CATIA kept the threading it carried "
+                "over from the previous hole (ThreadingMode could not be set to smooth). "
+                "It remains in the tree; delete it with catia_delete_feature, or retry "
+                "with threaded=true and explicit thread values.",
+                code="WRONG_GEOMETRY_EFFECT",
+                modified=None,
+            )
+
+    def _apply_thread(
+        self, part: Any, hole: Any, body: Any, snapshot: dict[str, Any], thread: dict[str, Any]
+    ) -> str:
+        """Thread an updated hole from a standard table, setting every thread
+        field so nothing carries over from the previous hole.
+
+        Field-proven on R428 SP6 (2026-11-02 field report):
+        CreateStandardThreadDesignTable(1) (metric coarse),
+        HoleThreadDescription.Value = "M6", ThreadDepth.Value = depth; CATIA
+        then set the tap drill (diameter 4.917). V5-6R2020: threading a hole
+        that has not materialized yet breaks the rebuild, so this runs AFTER
+        the first update. B30 type libraries: threaded = 0 (1 = smooth).
+        """
+        name = str(hole.Name)
+
+        def wrong(message: str) -> CATIAToolError:
+            return CATIAToolError(
+                f"Hole '{name}' was created but {message} It remains in the tree, not "
+                "correctly threaded; delete it with catia_delete_feature or fix the "
+                "thread in CATIA.",
+                code="WRONG_GEOMETRY_EFFECT",
+                modified=None,
+            )
+
+        if not _set_prop(hole, "ThreadingMode", _THREADED):
+            raise wrong("CATIA rejected the threading mode, so it is smooth.")
+        try:
+            hole.CreateStandardThreadDesignTable(thread["code"])
+        except Exception as error:
+            raise wrong(
+                f"CATIA refused the '{thread['standard']}' thread table "
+                f"(CreateStandardThreadDesignTable({thread['code']}): {error})."
+            ) from error
+        def set_param(prop: str, value: Any) -> bool:
+            try:
+                return _set_prop(getattr(hole, prop), "Value", value)
+            except Exception:  # the parameter itself is not exposed
+                return False
+
+        if not set_param("HoleThreadDescription", thread["designation"]):
+            raise wrong(f"CATIA rejected the thread designation '{thread['designation']}'.")
+        if not set_param("ThreadDepth", thread["depth"]):
+            raise wrong(f"CATIA rejected the thread depth {thread['depth']:g} mm.")
+
+        self._hole_update(part, hole, body, snapshot)
+
+        read_designation = self._read_value(hole, "HoleThreadDescription")
+        read_depth = self._read_value(hole, "ThreadDepth")
+        if read_designation is not None and str(read_designation).strip() != thread["designation"]:
+            raise wrong(
+                f"its thread designation reads '{read_designation}' after "
+                f"'{thread['designation']}' was set (not in the '{thread['standard']}' table?)."
+            )
+        if read_depth is not None and abs(float(read_depth) - thread["depth"]) > 1e-6:
+            raise wrong(
+                f"its thread depth reads {float(read_depth):g} mm after "
+                f"{thread['depth']:g} mm was set."
+            )
+        parts = [f"Threaded: {read_designation or thread['designation']} ({thread['standard']})"]
+        parts.append(f"thread depth {float(read_depth if read_depth is not None else thread['depth']):g} mm")
+        for label, prop in (("thread diameter", "ThreadDiameter"), ("pitch", "ThreadPitch")):
+            value = self._read_value(hole, prop)
+            if value is not None:
+                try:
+                    parts.append(f"{label} {float(value):g} mm")
+                except (TypeError, ValueError):
+                    pass
+        return " " + ", ".join(parts) + "; the hole diameter is the tap drill CATIA chose."
+
+    @staticmethod
+    def _read_value(obj: Any, prop: str) -> Any:
+        """``obj.<prop>.Value`` for a parameter-object property, else None."""
+        try:
+            return getattr(obj, prop).Value
+        except Exception:
+            return None
 
     def _rect_pattern(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()

@@ -308,6 +308,14 @@ class SessionTools:
         part = _try(conn.get_active_part) if data["active"] else None
         data["in_work_object"] = _text(_try(lambda: part.InWorkObject.Name)) if part else None
         data["selection_count"] = _try(lambda: conn.hso.Count) if data["active"] else None
+        if data["active"]:
+            # What a write lands on, as the write guard sees it: pass "id" as
+            # target_id to write tools; owner/state show whether it is protected.
+            from catia_mcp import guard
+
+            target = _try(lambda: guard.active_target(conn))
+            if target:
+                data["write_target"] = {**target, "user": guard.current_user()}
         active = data["active"]
         summary = (
             f"{active['kind']} '{active['name']}'" if active else "no active document"

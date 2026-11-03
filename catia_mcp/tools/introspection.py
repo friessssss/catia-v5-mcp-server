@@ -22,7 +22,13 @@ import re
 import traceback
 from typing import Any
 
-from catia_mcp.automation import evaluate, get_member
+from catia_mcp.automation import (
+    call_fill_array,
+    call_out_object,
+    call_out_values,
+    evaluate,
+    get_member,
+)
 from catia_mcp.connection import CATIAConnection
 from catia_mcp.errors import CATIAToolError, InvalidArgument, ObjectNotFound, PermissionDenied
 from catia_mcp.introspect import describe_members, find_enum, list_enums, type_name
@@ -131,7 +137,13 @@ class IntrospectionTools:
                     "Application), conn (connection helpers), platform ('v5'/'3dx'), "
                     "part(), body(), document(), editor(), product(), selection() "
                     "(resolve lazily, raise if absent), win32com, math, json, and "
-                    "session (a dict kept between calls). Print to report, or set "
+                    "session (a dict kept between calls). Methods that return values "
+                    "through ByRef/array parameters read back as None or zeros under "
+                    "pywin32; call them through CATIA's script engine instead: "
+                    "fill_array(obj, 'GetCoordinates', 3, *inputs) -> [x, y, z], "
+                    "out_values(obj, 'GetDirection', 3) -> scalar outs, "
+                    "out_object(obj, 'GetLink', *inputs) -> object out, "
+                    "vbscript(code, 'Fn', *args) for raw VBScript. Print to report, or set "
                     "`result` (or end with an expression) to return a value. COM "
                     "objects print as their type. Calls run on CATIA's thread, so keep "
                     "loops bounded; call part().Update() after changes and verify with a "
@@ -276,7 +288,29 @@ class IntrospectionTools:
         def editor() -> Any:
             return conn.active_editor
 
+        app = conn.app
+
+        def fill_array(obj: Any, method: str, count: int, *inputs: Any) -> list[float]:
+            return call_fill_array(app, obj, method, count, *inputs)
+
+        def out_values(obj: Any, method: str, count: int, *inputs: Any) -> list[Any]:
+            return call_out_values(app, obj, method, count, *inputs)
+
+        def out_object(obj: Any, method: str, *inputs: Any) -> Any:
+            return call_out_object(app, obj, method, *inputs)
+
+        def vbscript(code: str, function: str = "CATMain", *args: Any) -> Any:
+            return evaluate(app, code, function, list(args))
+
         namespace: dict[str, Any] = {
+            # ByRef/SAFEARRAY out-parameters come back empty through pywin32's
+            # late binding (field report 2026-11-02: GetLink, GetCoordinates,
+            # GetDirection); these run the call inside CATIA's script engine,
+            # the route the measurement tools already rely on.
+            "fill_array": fill_array,
+            "out_values": out_values,
+            "out_object": out_object,
+            "vbscript": vbscript,
             "catia": conn.app,
             "app": conn.app,
             "conn": conn,

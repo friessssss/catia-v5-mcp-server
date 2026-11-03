@@ -12,7 +12,7 @@ import json
 from typing import Any
 
 from catia_mcp.connection import CATIAConnection
-from catia_mcp.errors import InvalidArgument, ObjectNotFound
+from catia_mcp.errors import CATIAToolError, InvalidArgument, ObjectNotFound
 from catia_mcp.references import element_or_face_reference
 
 # Plane name mapping
@@ -119,7 +119,8 @@ class SketcherTools:
                 "name": "catia_sketch_rectangle",
                 "description": (
                     "Draw a rectangle in the active sketch defined by two opposite corners. "
-                    "Creates 4 lines forming a closed profile. Coordinates in mm."
+                    "Creates 4 lines forming a closed profile and, by default, length "
+                    "constraints for its width and height. Coordinates in mm."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -128,6 +129,15 @@ class SketcherTools:
                         "y1": {"type": "number", "description": "First corner Y (mm)"},
                         "x2": {"type": "number", "description": "Opposite corner X (mm)"},
                         "y2": {"type": "number", "description": "Opposite corner Y (mm)"},
+                        "dimensions": {
+                            "type": "boolean",
+                            "description": (
+                                "Add driving length constraints on one horizontal and one "
+                                "vertical edge (width and height), so drawings can generate "
+                                "the dimensions. Default true."
+                            ),
+                            "default": True,
+                        },
                     },
                     "required": ["x1", "y1", "x2", "y2"],
                 },
@@ -136,7 +146,8 @@ class SketcherTools:
                 "name": "catia_sketch_centered_rectangle",
                 "description": (
                     "Draw a rectangle centered at (cx, cy) with given width and height. "
-                    "Coordinates and dimensions in mm."
+                    "By default adds length constraints for the width and height, so a "
+                    "drawing can generate them. Coordinates and dimensions in mm."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -145,6 +156,15 @@ class SketcherTools:
                         "cy": {"type": "number", "description": "Center Y (mm)", "default": 0},
                         "width": {"type": "number", "description": "Width in mm"},
                         "height": {"type": "number", "description": "Height in mm"},
+                        "dimensions": {
+                            "type": "boolean",
+                            "description": (
+                                "Add driving length constraints on one horizontal and one "
+                                "vertical edge (width and height), so drawings can generate "
+                                "the dimensions. Default true."
+                            ),
+                            "default": True,
+                        },
                     },
                     "required": ["width", "height"],
                 },
@@ -281,11 +301,13 @@ class SketcherTools:
                 return self._draw_rectangle(
                     arguments["x1"], arguments["y1"],
                     arguments["x2"], arguments["y2"],
+                    dimensions=bool(arguments.get("dimensions", True)),
                 )
             case "catia_sketch_centered_rectangle":
                 return self._draw_centered_rectangle(
                     arguments.get("cx", 0), arguments.get("cy", 0),
                     arguments["width"], arguments["height"],
+                    dimensions=bool(arguments.get("dimensions", True)),
                 )
             case "catia_sketch_circle":
                 return self._draw_circle(
@@ -436,26 +458,76 @@ class SketcherTools:
         factory.CreateLine(x1, y1, x2, y2)
         return f"Line created from ({x1}, {y1}) to ({x2}, {y2}) mm"
 
-    def _draw_rectangle(self, x1: float, y1: float, x2: float, y2: float) -> str:
+    def _draw_rectangle(
+        self, x1: float, y1: float, x2: float, y2: float, *, dimensions: bool = True
+    ) -> str:
         self._ensure_sketch_open()
         factory = self._active_factory
 
         # Create 4 lines forming a closed rectangle
-        factory.CreateLine(x1, y1, x2, y1)  # bottom
-        factory.CreateLine(x2, y1, x2, y2)  # right
+        bottom = factory.CreateLine(x1, y1, x2, y1)
+        right = factory.CreateLine(x2, y1, x2, y2)
         factory.CreateLine(x2, y2, x1, y2)  # top
         factory.CreateLine(x1, y2, x1, y1)  # left
 
-        return (
+        result = (
             f"Rectangle created from ({x1}, {y1}) to ({x2}, {y2}) mm "
             f"[{abs(x2-x1):.1f} x {abs(y2-y1):.1f} mm]"
         )
+        if not dimensions:
+            return result
+        added = self._dimension_lines(
+            [("width", bottom, abs(x2 - x1)), ("height", right, abs(y2 - y1))]
+        )
+        return f"{result}; constraints: {', '.join(added)}"
+
+    def _dimension_lines(self, edges: list[tuple[str, Any, float]]) -> list[str]:
+        """Driving length constraint on each (label, line, length).
+
+        Field-proven on 3DEXPERIENCE R428 SP6 (2026-11-02 field report):
+        Constraints.AddMonoEltCst(5, reference of the line) (5 =
+        catCstTypeLength), then cst.Dimension.Value = length. The field
+        recipe called Sketch.OpenEdition() first because it ran on a closed
+        sketch; here the sketch is still in edition from catia_create_sketch.
+        Mode = 0 (driving) is the V5-6R2020 recipe of catia_sketch_constraint.
+        The rectangle lines already exist when this runs, so a failure is
+        reported as a modified model.
+        """
+        sketch = self._active_sketch
+        part = getattr(self, "_sketch_part", None) or self.conn.get_active_part()
+        added: list[str] = []
+        try:
+            constraints = sketch.Constraints
+            for label, line, length in edges:
+                if length <= 0:
+                    continue
+                cst = constraints.AddMonoEltCst(self._CST_LENGTH, part.CreateReferenceFromObject(line))
+                try:
+                    cst.Mode = 0
+                except Exception:
+                    pass
+                cst.Dimension.Value = length
+                try:
+                    name = str(cst.Name)
+                except Exception:
+                    name = "Length"
+                added.append(f"{label} {length:g} mm ('{name}')")
+        except Exception as error:
+            done = f" ({', '.join(added)} added)" if added else ""
+            raise CATIAToolError(
+                f"The rectangle lines were drawn, but adding its length constraints "
+                f"failed{done}: {error}. Do not redraw it: add the missing dimension with "
+                "catia_sketch_constraint (type 'distance' on one line), or ignore it if "
+                "the drawing does not need it.",
+                modified=None,
+            ) from error
+        return added
 
     def _draw_centered_rectangle(
-        self, cx: float, cy: float, width: float, height: float
+        self, cx: float, cy: float, width: float, height: float, *, dimensions: bool = True
     ) -> str:
         hw, hh = width / 2, height / 2
-        return self._draw_rectangle(cx - hw, cy - hh, cx + hw, cy + hh)
+        return self._draw_rectangle(cx - hw, cy - hh, cx + hw, cy + hh, dimensions=dimensions)
 
     def _draw_circle(self, cx: float, cy: float, radius: float) -> str:
         self._ensure_sketch_open()

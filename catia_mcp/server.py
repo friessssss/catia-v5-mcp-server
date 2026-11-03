@@ -19,6 +19,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, ImageContent, TextContent, Tool
 
 from catia_mcp import __version__
+from catia_mcp import guard
 from catia_mcp.com_thread import BUSY_HRESULTS, hresult, init_worker
 from catia_mcp.connection import CATIAConnection, normalize_platform
 from catia_mcp.errors import CATIAToolError
@@ -94,6 +95,14 @@ UNSUPPORTED_CAPABILITY, FEATURE_NO_EFFECT, CATIA_BUSY, CATIA_TIMEOUT,
 CATIA_NOT_RUNNING, COM_ERROR) and `effects.modified` says whether the model
 may have changed.
 
+Shared database safety (3DEXPERIENCE): every modifying tool is refused with
+WRITE_PROTECTED when the active object belongs to another user or is
+Frozen/Released/Obsolete; only pass allow_protected_write=true when the user
+explicitly asked to change that object. Before writes, read
+catia_status.write_target and pass its id as target_id: the call is then
+refused (TARGET_MISMATCH) if another window is in front. Never save
+(catia_save_document publishes to the shared space) unless the user asked.
+
 When no dedicated tool fits, use catia_run_python: it runs Python in the
 server with the live COM objects (catia, part, editor, ...) and returns
 printed output and a `result` value. Look members up first with
@@ -101,6 +110,9 @@ catia_inspect_api (live type library) or catia_api_search (the
 installation's automation reference). catia_undo reverts mistakes.
 """
 
+
+_SCRIPT_TOOLS = frozenset({"catia_run_python", "catia_run_script"})
+_CREATES_CONTENT = frozenset({"catia_new_part", "catia_new_product", "catia_new_drawing"})
 
 # Tools that manage the connection themselves: status and the API docs must
 # answer while CATIA is not running.
@@ -164,6 +176,24 @@ _DESTRUCTIVE = re.compile(
     r"^catia_(close_document|delete_.*|run_python|run_script|set_plm_attributes|"
     r"save_document|disconnect|.*_delete_.*)$"
 )
+
+
+def is_guarded(definition: dict[str, Any]) -> bool:
+    """Modifying tools that act on existing content go through the guard."""
+    name = definition["name"]
+    if name in guard.EXEMPT:
+        return False
+    hints = definition.get("annotations") or default_annotations(name)
+    return not hints.get("readOnlyHint", False)
+
+
+def _with_guard_args(definition: dict[str, Any]) -> dict[str, Any]:
+    schema = dict(definition["inputSchema"])
+    properties = dict(schema.get("properties") or {})
+    for key, spec in guard.GUARD_SCHEMA.items():
+        properties.setdefault(key, spec)
+    schema["properties"] = properties
+    return schema
 
 
 def default_annotations(name: str) -> dict[str, Any]:
@@ -268,13 +298,18 @@ class CATIAMCPServer:
         self.toolset = os.environ.get("CATIA_MCP_TOOLSET", "full").strip().lower() or "full"
         self._tool_router: dict[str, Any] = {}
         self._schemas: dict[str, dict] = {}
+        self._guarded: set[str] = set()
         for module in self._tool_modules:
             for definition in module.get_tool_definitions():
                 name = definition["name"]
                 if name in self._tool_router:
                     raise ValueError(f"Duplicate tool: {name}")
                 self._tool_router[name] = module
-                self._schemas[name] = definition["inputSchema"]
+                if is_guarded(definition):
+                    self._guarded.add(name)
+                self._schemas[name] = _with_guard_args(definition) if name in self._guarded else (
+                    definition["inputSchema"]
+                )
         self._setup_handlers()
 
     def _setup_handlers(self) -> None:
@@ -296,6 +331,8 @@ class CATIAMCPServer:
                     continue
                 definition = dict(definition)
                 definition.setdefault("annotations", default_annotations(definition["name"]))
+                if definition["name"] in self._guarded:
+                    definition["inputSchema"] = _with_guard_args(definition)
                 tools.append(Tool(**definition))
         return tools
 
@@ -400,6 +437,9 @@ class CATIAMCPServer:
         except ValidationError as error:
             return failure("INVALID_ARGUMENT", error.message, "validate", False, name)
         logger.info("Tool call: %s(%s)", name, _preview(arguments))
+        arguments = dict(arguments)
+        target_id = arguments.pop("target_id", None)
+        override = bool(arguments.pop("allow_protected_write", False))
         stage = "connect"
         try:
             if name not in _NO_AUTO_CONNECT:
@@ -410,7 +450,16 @@ class CATIAMCPServer:
                 # closed or used as a profile in the next one.
                 self.sketcher_tools.reset_session_state()
             stage = "connect" if name == "catia_connect" else "execute"
+            target = None
+            if self._needs_guard(name, arguments):
+                target = self._guard(module, name, arguments, target_id, override)
+            if name in _SCRIPT_TOOLS:
+                self._log_script(name, arguments.get("code", ""), target)
             result = module.execute(name, arguments)
+            if name in _SCRIPT_TOOLS and isinstance(result, dict):
+                self._audit_script(arguments.get("code", ""), target, result)
+            if name in _CREATES_CONTENT:
+                self._learn_login()
             if isinstance(result, CallToolResult):
                 return result
             if isinstance(result, dict):
@@ -463,6 +512,80 @@ class CATIAMCPServer:
             if isinstance(error, ValueError):
                 return failure("INVALID_ARGUMENT", str(error), stage, modified, name)
             return failure("COM_ERROR", str(error), stage, modified, name)
+
+    def _needs_guard(self, name: str, arguments: dict[str, Any]) -> bool:
+        """Guarded tools, plus the ones whose writing depends on arguments."""
+        if name == "catia_save_document" and arguments.get("preview"):
+            return False  # a preview writes nothing: let it describe protected content
+        if name == "catia_close_document":
+            return bool(arguments.get("save"))  # close-with-save publishes
+        if name == "catia_drawing_list_dimensions":
+            # refresh (default) regenerates the views, which modifies them.
+            return arguments.get("refresh", True) is not False
+        return name in self._guarded
+
+    def _guard(
+        self,
+        module: Any,
+        name: str,
+        arguments: dict[str, Any],
+        target_id: str | None,
+        override: bool,
+    ) -> dict[str, Any] | None:
+        """Write guard (catia_mcp/guard.py). A module may name the object a
+        call really writes (write_target), e.g. a drawing found by title
+        while another window is in front."""
+        entity = None
+        hook = getattr(module, "write_target", None)
+        if hook is not None:
+            # A typed failure here (no drawing to write) is the tool's own
+            # failure too: report it before anything runs.
+            entity = hook(name, arguments)
+        try:
+            target = guard.active_target(self.connection, entity)
+        except Exception as error:  # noqa: BLE001 -- nothing open / readable to protect
+            if target_id:
+                raise guard.TargetMismatch(
+                    f"{name} was meant for '{target_id}', but the object it would modify "
+                    f"could not be identified ({error}). Nothing was changed."
+                ) from error
+            return None
+        target = guard.check(self.connection, name, target_id, override, target)
+        if override:
+            logger.warning("Write guard overridden: %s on %s", name, target)
+        return target
+
+    def _learn_login(self) -> None:
+        """New content is owned by the 3DEXPERIENCE login, which may differ
+        from the Windows user name: learn it so the guard never blocks the
+        user's own work."""
+        if not self.connection.is_3dx:
+            return
+        try:
+            guard.learn_login(guard.active_target(self.connection).get("owner"))
+        except Exception:  # noqa: BLE001 -- best effort
+            pass
+
+    def _log_script(self, name: str, code: str, target: dict[str, Any] | None) -> None:
+        """Logged before running, so a script that deletes and then fails is
+        still on record."""
+        calls = guard.risky_calls(code)
+        if calls:
+            where = (target or {}).get("title") or (target or {}).get("id") or "the active window"
+            logger.warning("%s about to run %s with '%s' active", name, ", ".join(calls), where)
+
+    def _audit_script(self, code: str, target: dict[str, Any] | None, result: dict) -> None:
+        """Log and report deletes, saves and pastes a script performed."""
+        calls = guard.risky_calls(code)
+        if not calls:
+            return
+        where = (target or {}).get("title") or (target or {}).get("id") or "the active window"
+        message = (
+            f"Script called {', '.join(calls)} with '{where}' active: check that only "
+            "the intended objects were affected."
+        )
+        logger.warning("catia_run_python audit: %s", message)
+        result.setdefault("warnings", []).append(message)
 
     def _reset_stale_modules(self) -> None:
         """After CATIA was re-attached (restart, disconnect), drop the COM
@@ -521,7 +644,7 @@ class CATIAMCPServer:
             await self.close()
 
 
-COMMANDS = ("serve", "proxy", "install", "uninstall", "start", "stop", "status")
+COMMANDS = ("serve", "proxy", "install", "uninstall", "update", "start", "stop", "status")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -534,7 +657,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "speaks MCP over stdio. Commands: install (background service that starts "
             "at logon + Claude client setup), serve (run the HTTP service in the "
             "foreground), proxy (stdio bridge to the service, used by Claude Desktop), "
-            "start, stop, status, uninstall."
+            "update (install the newest version of the branch you installed; --check only "
+            "compares), start, stop, status, uninstall."
         ),
     )
     parser.add_argument("command", nargs="?", choices=COMMANDS, help="Optional command")
@@ -576,6 +700,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Disable the script tools.",
     )
     parser.add_argument(
+        "--branch",
+        default=None,
+        help="update: branch to install (default: the one this copy came from)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="update: only report whether GitHub has a newer commit",
+    )
+    parser.add_argument(
         "--no-clients",
         action="store_true",
         help="install: do not configure Claude Desktop / Claude Code",
@@ -610,13 +744,19 @@ def main(argv: list[str] | None = None) -> None:
         print(new_token())
         return
     command = "serve" if args.http and args.command is None else args.command
-    if command in ("install", "uninstall", "start", "stop", "status"):
+    if command in ("install", "uninstall", "update", "start", "stop", "status"):
         from catia_mcp import service
 
         if command == "install":
             lines = service.install(args.port, configure_clients=not args.no_clients)
         elif command == "uninstall":
             lines = service.uninstall(args.port)
+        elif command == "update":
+            lines = (
+                service.update_check(args.branch)
+                if args.check
+                else service.update(args.branch, port=args.port)
+            )
         elif command == "start":
             status = service.ensure_running(args.port)
             lines = [f"Service running at {service.mcp_url(args.port)} (PID {status.get('pid')})."]

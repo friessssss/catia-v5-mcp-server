@@ -102,6 +102,58 @@ open PowerShell and run `catia-mcp status`: expected `Service: running`.
 (Paste `%LOCALAPPDATA%\catia-mcp` into the File Explorer address bar to open
 the log folder.)
 
+## Round 2 checks (after the 2026-11-02 field report)
+
+Update first (`catia-mcp update`, or the install command at the top for the
+very first time), check `catia-mcp status` shows the new commit.
+
+**A. Probe (2 minutes, creates nothing).** Open a 3D Part you made in
+the UI in CATIA, then paste one line at a time:
+
+```powershell
+irm https://raw.githubusercontent.com/friessssss/catia-v5-mcp-server/claude/background-service-catia-c43f2e/scripts/probe_3dx.py -OutFile $env:TEMP\probe_3dx.py
+```
+
+```powershell
+& "$env:APPDATA\uv\tools\catia-v5-mcp-server\Scripts\python.exe" $env:TEMP\probe_3dx.py
+```
+
+Send back `probe_3dx.json` from the Desktop.
+
+**B. In Claude Desktop, with that 3D Part still open:**
+
+1. `Create a new 3D Part called probe part 2.` Note whether a 3D Part (not
+   a 3D Shape) appears and how many licence dialogs pop up.
+2. `Pad a 100 x 100 x 60 block, list its edges, then fillet all edges R5.`
+   Expect 12 edges and one fillet, no error.
+3. `Drill an M6 tapped hole through the centre (metric coarse).` Expect a
+   Ø4.917 tap drill, M6, through.
+4. `Make a drawing on A1, third angle, with top, front and section views and
+   generate dimensions on the top view.` Note dimensions landing in other
+   views and any 120° / Ø4.917 / duplicate 60 that survive.
+5. `Apply <your company drawing template> and link the PART NUMBER cell to
+   the part's EIN.`
+6. `Assign an EIN to probe part 2.` Note what happens (number, dialog, or a
+   message to use the UI).
+7. Safety: with the template window in front, `Add a text "test" to this
+   drawing.` Expected: refused with WRITE_PROTECTED (owned by another user).
+8. `Preview saving probe part 2.` Expected: a description, nothing saved.
+
+## Updating to a newer version
+
+Once version 0.3.0 or later is installed, updating is one command:
+
+```powershell
+catia-mcp update
+```
+
+It opens a new PowerShell window that installs the newest code from the
+same branch and restarts the service. If Claude Desktop is open it is closed
+during the update and reopened automatically when the window says **Done**
+(chats are kept; finish or stop any reply in progress first). Then run
+`catia-mcp status` and check the `Commit:` line. `catia-mcp update --check` only reports whether a
+newer commit exists.
+
 ## Undo everything
 
 ```powershell

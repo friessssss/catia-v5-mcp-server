@@ -84,6 +84,26 @@ so they keep working whatever the PATH is.
 Restart Claude Desktop afterwards (quit it from the tray icon, not just the
 window).
 
+
+## Updating
+
+```powershell
+catia-mcp update            # newest commit of the branch this copy was installed from
+catia-mcp update --check    # only compare the installed commit with GitHub
+catia-mcp update --branch main
+```
+
+Windows locks the files of a running `catia-mcp.exe`, so `update` cannot
+reinstall itself: it starts `scripts/install.ps1` for the same repository
+and branch (read from the install's `direct_url.json`) in a new PowerShell
+window and exits. The installer stops the service and any copies Claude
+Desktop started, reinstalls, restarts the service and rewrites the client
+configuration. A running Claude Desktop is closed before the reinstall
+(it holds the old `catia-mcp proxy`) and reopened at the end, also when the
+install fails; only the Desktop app is matched by its install folder, never
+the Claude Code CLI (also `claude.exe`). `install.ps1 -NoRestartClaude`
+skips this.
+
 ## Why a per-user process and not a Windows Service
 
 CATIA registers its COM server in the Running Object Table of the logged-in

@@ -404,3 +404,96 @@ def test_install_still_configures_clients_when_the_service_is_slow(monkeypatch, 
     lines = service.install(8765)
     assert any(line.startswith("SERVICE NOT RUNNING") for line in lines)
     assert config.exists()
+
+
+# ── catia-mcp update ──
+
+
+def _fake_dist(monkeypatch, direct_url):
+    import importlib.metadata as md
+
+    class Dist:
+        def read_text(self, name):
+            return json.dumps(direct_url) if name == "direct_url.json" else None
+
+    monkeypatch.setattr(md, "distribution", lambda name: Dist())
+
+
+def test_installed_source_reads_repo_branch_from_uv_git_install(monkeypatch):
+    _fake_dist(monkeypatch, {
+        "url": "https://github.com/friessssss/catia-v5-mcp-server",
+        "vcs_info": {"vcs": "git", "requested_revision": "claude/background-service-catia-c43f2e",
+                     "commit_id": "c9bde35145aa0000"},
+    })
+    source = service.installed_source()
+    assert source["repo"] == "friessssss/catia-v5-mcp-server"
+    assert source["branch"] == "claude/background-service-catia-c43f2e"
+
+
+def test_installed_source_reads_zip_fallback_install(monkeypatch):
+    _fake_dist(monkeypatch, {
+        "url": "https://github.com/friessssss/catia-v5-mcp-server/archive/feature/x.zip",
+        "archive_info": {},
+    })
+    source = service.installed_source()
+    assert source["repo"] == "friessssss/catia-v5-mcp-server" and source["branch"] == "feature/x"
+
+
+def test_update_command_reruns_installer_for_the_installed_branch():
+    command = service.update_command("claude/bg", "friessssss/catia-v5-mcp-server", 8765)
+    script = command[-1]
+    assert command[0] == "powershell.exe" and "-NoExit" in command
+    assert "raw.githubusercontent.com/friessssss/catia-v5-mcp-server/claude/bg/scripts/install.ps1?t=" in script
+    assert "-Branch 'claude/bg'" in script and "-Repo 'friessssss/catia-v5-mcp-server'" in script
+
+
+def test_update_starts_the_installer_detached_on_windows(monkeypatch):
+    started = []
+    monkeypatch.setattr(service.os, "name", "nt")
+    monkeypatch.setattr(service.subprocess, "CREATE_NEW_CONSOLE", 16, raising=False)
+    monkeypatch.setattr(service.subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000, raising=False)
+    monkeypatch.setattr(service.subprocess, "Popen", lambda cmd, **kw: started.append((cmd, kw)))
+    monkeypatch.setattr(service, "installed_source",
+                        lambda: {"repo": "o/r", "branch": "b", "commit": "abc"})
+    lines = service.update()
+    assert started and started[0][1]["creationflags"] == 16 | 0x01000000
+    assert "o/r@b" in lines[0]
+
+
+def test_update_check_compares_with_github(monkeypatch):
+    monkeypatch.setattr(service, "installed_source",
+                        lambda: {"repo": "o/r", "branch": "b", "commit": "abc123def456"})
+    monkeypatch.setattr(service, "latest_commit", lambda repo, branch: "abc123def4567890")
+    assert "Up to date" in service.update_check()[1]
+    monkeypatch.setattr(service, "latest_commit", lambda repo, branch: "fff000")
+    assert "Update available: fff000" in service.update_check()[1]
+
+
+def test_installer_restarts_claude_desktop_but_never_claude_code():
+    ps1 = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    assert "Close-ClaudeDesktop" in ps1 and "Start-ClaudeDesktop" in ps1
+    assert "[switch]$NoRestartClaude" in ps1
+    # Matched by the Desktop app's install folders only: Claude Code's CLI
+    # is also claude.exe (in .local\bin or node_modules).
+    assert "'*\\WindowsApps\\*Claude*'" in ps1 and "'*\\AnthropicClaude\\*'" in ps1
+    assert ".local\\bin\\*" not in ps1.split("function Get-ClaudeDesktopProcesses")[1].split("}")[0]
+    # Reopened even when the install fails after closing it.
+    assert "if ($script:ClaudeClosed) { Start-ClaudeDesktop }" in ps1
+    ps1.encode("ascii")  # PowerShell 5.1 reads BOM-less scripts as ANSI
+
+
+def test_update_rejects_branch_names_that_could_break_the_command():
+    with pytest.raises(ValueError):
+        service.update_command("x'; Remove-Item C:\\ -Recurse; '", "o/r", 8765)
+
+
+def test_update_check_without_installed_commit_says_unknown(monkeypatch):
+    monkeypatch.setattr(service, "installed_source",
+                        lambda: {"repo": "o/r", "branch": "b", "commit": None})
+    monkeypatch.setattr(service, "latest_commit", lambda repo, branch: "fff000")
+    assert "unknown" in service.update_check()[1]
+
+
+def test_installer_wraps_the_desktop_process_list_for_strict_mode():
+    ps1 = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    assert "$procs = @(Get-ClaudeDesktopProcesses)" in ps1

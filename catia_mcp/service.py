@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -423,3 +424,129 @@ def status_lines(port: int = DEFAULT_PORT) -> list[str]:
         lines.append(f"Autostart: {'on' if autostart else 'off'}")
     lines.append(f"Logs: {log_path()}")
     return lines
+
+
+# ── Update ──
+
+DEFAULT_REPO = "friessssss/catia-v5-mcp-server"
+_GITHUB_URL = re.compile(r"github\.com[/:]([^/]+/[^/@#.]+?)(?:\.git)?(?:/archive/(.+)\.zip)?$")
+
+
+def installed_source() -> dict[str, str | None]:
+    """Where this copy was installed from: {repo, branch, commit}, read from
+    the PEP 610 direct_url.json that `uv tool install git+...` records."""
+    from catia_mcp.paths import build_commit
+
+    source: dict[str, str | None] = {"repo": None, "branch": None, "commit": build_commit()}
+    try:
+        from importlib.metadata import distribution
+
+        text = distribution("catia-v5-mcp-server").read_text("direct_url.json")
+        info = json.loads(text) if text else {}
+    except Exception:  # noqa: BLE001 -- editable or unknown install
+        info = {}
+    url = str(info.get("url") or "")
+    match = _GITHUB_URL.search(url.removeprefix("git+"))
+    if match:
+        source["repo"] = match.group(1)
+        source["branch"] = match.group(2)
+    vcs = info.get("vcs_info") or {}
+    if vcs.get("requested_revision"):
+        source["branch"] = vcs["requested_revision"]
+    return source
+
+
+def latest_commit(repo: str, branch: str, timeout: float = 10.0) -> str | None:
+    """Head commit of `branch` on GitHub (public API; honours the system
+    proxy, unlike the loopback calls)."""
+    try:
+        response = httpx.get(
+            f"https://api.github.com/repos/{repo}/commits/{branch}",
+            headers={"Accept": "application/vnd.github.sha"},
+            timeout=timeout,
+        )
+    except httpx.HTTPError:
+        return None
+    if response.status_code != 200:
+        return None
+    return response.text.strip()[:40] or None
+
+
+def update_check(branch: str | None = None, repo: str | None = None) -> list[str]:
+    source = installed_source()
+    repo = repo or source["repo"] or DEFAULT_REPO
+    branch = branch or source["branch"] or "main"
+    installed = source["commit"]
+    latest = latest_commit(repo, branch)
+    lines = [f"Installed: {installed or 'unknown'} from {repo}@{branch}"]
+    if latest is None:
+        lines.append("Could not reach GitHub to check for a newer commit.")
+    elif not installed:
+        lines.append(
+            f"Latest on GitHub: {latest[:12]}. The installed commit is unknown (installed "
+            "without git), so it cannot be compared: run catia-mcp update to be sure."
+        )
+    elif installed and latest.startswith(installed):
+        lines.append(f"Up to date (latest {latest[:12]}).")
+    else:
+        lines.append(f"Update available: {latest[:12]}. Run: catia-mcp update")
+    return lines
+
+
+_SAFE_REF = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
+def update_command(branch: str, repo: str, port: int) -> list[str]:
+    """The PowerShell command that re-runs the installer for repo@branch.
+    A query string makes raw.githubusercontent.com skip its ~5 min cache."""
+    for value, what in ((branch, "branch"), (repo, "repository")):
+        # Interpolated into a single-quoted PowerShell string below.
+        if not _SAFE_REF.match(value):
+            raise ValueError(f"Unsupported {what} name {value!r} for catia-mcp update.")
+    stamp = int(time.time())
+    url = f"https://raw.githubusercontent.com/{repo}/{branch}/scripts/install.ps1?t={stamp}"
+    script = (
+        f"& ([scriptblock]::Create((irm '{url}'))) -Branch '{branch}' -Repo '{repo}' "
+        f"-Port {port}; Write-Host ''; Write-Host 'You can close this window.'"
+    )
+    return ["powershell.exe", "-NoProfile", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", script]
+
+
+def update(branch: str | None = None, repo: str | None = None, port: int = DEFAULT_PORT) -> list[str]:
+    """Re-run the installer in a new window. This process exits at once:
+    Windows locks the files of a running catia-mcp.exe, so it cannot
+    reinstall itself; the installer stops the service, reinstalls, restarts
+    it and reconfigures the clients."""
+    source = installed_source()
+    repo = repo or source["repo"] or DEFAULT_REPO
+    branch = branch or source["branch"] or "main"
+    if os.name != "nt":
+        spec = f"catia-v5-mcp-server[images] @ git+https://github.com/{repo}@{branch}"
+        return [
+            "catia-mcp update runs the Windows installer; on this platform run:",
+            f'    uv tool install --force "{spec}" && catia-mcp install',
+        ]
+    command = update_command(branch, repo, port)
+    # The user's own installer, in a visible window they can watch. It must
+    # outlive the caller: run from Claude Code or Desktop, the window would
+    # sit in their kill-on-close job and die when the installer closes
+    # Claude Desktop, so break away from the job when allowed.
+    flags = subprocess.CREATE_NEW_CONSOLE
+    try:
+        subprocess.Popen(
+            command,
+            creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB,
+            cwd=str(state_dir()),
+            close_fds=True,
+        )
+    except PermissionError:  # the job forbids breakaway
+        subprocess.Popen(command, creationflags=flags, cwd=str(state_dir()), close_fds=True)
+    started = (
+        f"Updating from {repo}@{branch} in a new PowerShell window (installed: "
+        f"{source['commit'] or 'unknown'})."
+    )
+    after = (
+        "Claude Desktop, if open, is closed for the update and reopened when it is "
+        "done (chats are kept). Then run 'catia-mcp status' to see the new commit."
+    )
+    return [started, after]

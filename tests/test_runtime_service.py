@@ -313,3 +313,29 @@ def test_desktop_config_with_bom_is_updated(tmp_path):
     service.update_desktop_config(path, {"command": "py", "args": ["-m", "catia_mcp", "proxy"]})
     data = json.loads(path.read_text(encoding="utf-8"))
     assert set(data["mcpServers"]) == {"other", "catia"}
+
+
+def test_run_python_exposes_out_parameter_helpers():
+    calls = []
+
+    class SystemService:
+        def Evaluate(self, code, language, function, params):  # noqa: N802
+            calls.append((function, code))
+            return [1.0, 2.0, 3.0] if function == "catia_mcp_fill" else ["a", "b"]
+
+    async def body():
+        server = CATIAMCPServer(allow_scripts=True)
+        server.connection.app = SimpleNamespace(Caption="CATIA", SystemService=SystemService())
+        server.connection.platform = "3dx"
+        try:
+            result = await server.call_tool(
+                "catia_run_python",
+                {"code": "result = [fill_array(object(), 'GetCoordinates', 3), "
+                         "out_values(object(), 'GetDirection', 2)]"},
+            )
+            assert result.structuredContent["data"]["result"] == [[1.0, 2.0, 3.0], ["a", "b"]]
+        finally:
+            await server.close()
+
+    run(body())
+    assert "o.GetCoordinates a" in calls[0][1] and "o.GetDirection r0, r1" in calls[1][1]

@@ -22,7 +22,14 @@ from catia_mcp.errors import (
     UnsupportedCapability,
     after_mutation,
 )
-from catia_mcp.plm import DEFAULT_PLM_TYPE_ENV, PLMSession, file_alerts_off
+from catia_mcp.plm import (
+    DEFAULT_PLM_TYPE_ENV,
+    PART_TYPE_ENV,
+    PRODUCT_TYPE_ENV,
+    PLMSession,
+    file_alerts_off,
+)
+
 
 def _mtime(path: str) -> int | None:
     """Modification time of an existing file, else None."""
@@ -82,9 +89,13 @@ class DocumentTools:
                 "description": (
                     "Create a new empty Part for single-body 3D modeling (sketches + "
                     "features). V5: a CATPart document. 3DEXPERIENCE: a 3D Part "
-                    "(product + shape, needs the matching licence/role) or a 3D Shape, "
-                    "created in session only; nothing reaches the database until "
-                    "catia_save_document."
+                    "(product + shape; drawable and insertable into assemblies) or, as "
+                    "a last resort, a standalone 3D Shape (cannot be put on a drawing or "
+                    "into an assembly), created in session only; nothing reaches the "
+                    "database until catia_save_document. Sites often use customized "
+                    "part types: if 3D Part creation is refused, ask the user to open "
+                    "any 3D Part they made in the UI, then retry: the tool learns the "
+                    "site's part type from it (and remembers a type that worked)."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -95,13 +106,16 @@ class DocumentTools:
                         },
                         "plm_type": {
                             "type": "string",
-                            "enum": ["auto", "3DPart", "3DShape"],
                             "description": (
-                                "3DEXPERIENCE only. 'auto' (default) tries a 3D Part and "
-                                "falls back to a 3D Shape when CATIA refuses it (the refusal "
-                                "is remembered for the session, so later 'auto' calls go "
-                                f"straight to 3D Shape). {DEFAULT_PLM_TYPE_ENV}=3DShape on the "
-                                "server skips the 3D Part attempt."
+                                "3DEXPERIENCE only: 'auto' (default), '3DPart', '3DShape', or "
+                                "a site-customized PLM type name (e.g. 'XYZ_Part'). 'auto' "
+                                "tries, skipping any type refused on this machine (each "
+                                "refusal shows the user a licence dialog): the type that "
+                                f"worked before, {PART_TYPE_ENV}, the customized type of any "
+                                "3D Part open in the session, '3DPart', and finally a 3D "
+                                f"Shape. {DEFAULT_PLM_TYPE_ENV}=3DShape on the server skips "
+                                "the 3D Part attempts. An explicit type is always attempted "
+                                "and never falls back."
                             ),
                         },
                     },
@@ -111,8 +125,10 @@ class DocumentTools:
                 "name": "catia_new_product",
                 "description": (
                     "Create a new empty Product (assembly). V5: a CATProduct document. "
-                    "3DEXPERIENCE: a Physical Product (VPMReference), which needs a "
-                    "licence/role allowing scripted product creation on many sites."
+                    "3DEXPERIENCE: a Physical Product (VPMReference or the site's "
+                    "customized type). If creation is refused, ask the user to open any "
+                    "Physical Product they made in the UI, then retry: the tool learns "
+                    "the site's product type from it."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -120,6 +136,16 @@ class DocumentTools:
                         "name": {
                             "type": "string",
                             "description": "Optional name for the product/assembly",
+                        },
+                        "plm_type": {
+                            "type": "string",
+                            "description": (
+                                "3DEXPERIENCE only: 'auto' (default) or a PLM type name. "
+                                "'auto' tries the type that worked before, "
+                                f"{PRODUCT_TYPE_ENV}, the customized type of any Physical "
+                                "Product open in the session, then 'VPMReference', skipping "
+                                "types refused on this machine."
+                            ),
                         },
                     },
                 },
@@ -149,7 +175,9 @@ class DocumentTools:
                     "Save the active document. V5: Save, or Save As when file_path is "
                     "given. 3DEXPERIENCE: saves (propagates) the active editor's content "
                     "to the 3DSpace database; file_path is not accepted there (use "
-                    "catia_export to write a file). " + DB_SAVE_NOTE
+                    "catia_export to write a file). It writes every modified object "
+                    "loaded in that editor (also children), but the write guard only "
+                    "checks the root object: use preview first. " + DB_SAVE_NOTE
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -157,6 +185,14 @@ class DocumentTools:
                         "file_path": {
                             "type": "string",
                             "description": "V5 only: new file path for Save As",
+                        },
+                        "preview": {
+                            "type": "boolean",
+                            "description": (
+                                "Only report what would be written (title, PLM id, owner, "
+                                "maturity); save nothing. Use it before a 3DEXPERIENCE save: "
+                                "saving publishes to the shared collaborative space."
+                            ),
                         },
                     },
                 },
@@ -231,11 +267,13 @@ class DocumentTools:
             case "catia_new_part":
                 return self._new_part(arguments.get("name"), arguments.get("plm_type") or "auto")
             case "catia_new_product":
-                return self._new_product(arguments.get("name"))
+                return self._new_product(arguments.get("name"), arguments.get("plm_type") or "auto")
             case "catia_open_document":
                 return self._open_document(arguments["file_path"])
             case "catia_save_document":
-                return self._save_document(arguments.get("file_path"))
+                return self._save_document(
+                    arguments.get("file_path"), bool(arguments.get("preview", False))
+                )
             case "catia_close_document":
                 return self._close_document(arguments.get("save", False))
             case "catia_list_documents":
@@ -298,31 +336,22 @@ class DocumentTools:
                 return f"{self.plm.title_of(active)} (title '{name}' could not be applied)"
         return self.plm.title_of(active)
 
-    def _new_product(self, name: str | None = None) -> str:
+    def _new_product(self, name: str | None = None, plm_type: str = "auto") -> str:
         self.conn.ensure_connected()
         if self.conn.is_3dx:
-            cached = self.plm.refused("VPMReference")
-            if cached is not None:
-                # Each refused attempt shows a licence dialog: do not ask again.
-                raise UnsupportedCapability(
-                    f"3DEXPERIENCE refused to create a Physical Product earlier on this "
-                    f"machine ({cached}); not retried, to avoid another licence dialog. "
-                    "Create the product in the UI or open an existing one with "
-                    "catia_open_from_database."
-                )
-            try:
-                self.plm.create("VPMReference")
-            except Exception as e:
-                raise RuntimeError(
-                    f"3DEXPERIENCE refused to create a Physical Product ({e}). Scripted "
-                    "product creation needs a licence/role that many sites do not grant "
-                    "(field reports: 'Operation not authorized'). Create the product in "
-                    "the UI or open an existing one with catia_open_from_database."
-                ) from e
+            # Refused types are cached on disk (each refusal shows a licence
+            # dialog) and never retried by 'auto'; see PLMSession.create_product.
+            created, note = self.plm.create_product(plm_type)
             with after_mutation():
                 title = self._apply_title(name, None)
             self.conn.refresh_display()
-            return f"Created new Physical Product '{title}' in the session (not yet saved)."
+            label = "Physical Product" if created == "VPMReference" else f"Physical Product ({created})"
+            return (
+                f"Created new {label} '{title}' in the session (not yet saved)."
+                + (f" {note}" if note else "")
+            )
+        if plm_type != "auto":
+            raise InvalidArgument("plm_type applies to 3DEXPERIENCE only; omit it on CATIA V5.")
         docs = self.conn.documents
         doc = docs.Add("Product")
         rename_note = ""
@@ -372,7 +401,21 @@ class DocumentTools:
         doc = docs.Open(file_path)
         return f"Opened document: '{doc.Name}' from {file_path}"
 
-    def _save_document(self, file_path: str | None = None) -> str:
+    def _describe_save_target(self) -> str:
+        from catia_mcp import guard
+
+        try:
+            target = guard.active_target(self.conn)
+        except Exception:  # noqa: BLE001 -- description only
+            return ""
+        parts = [f"id {target['id'] or 'not yet in the database'}"]
+        if target["owner"]:
+            parts.append(f"owner {target['owner']}")
+        if target["state"]:
+            parts.append(f"maturity {target['state']}")
+        return " (" + ", ".join(parts) + ")"
+
+    def _save_document(self, file_path: str | None = None, preview: bool = False) -> str:
         if self.conn.is_3dx:
             if file_path:
                 raise InvalidArgument(
@@ -381,8 +424,22 @@ class DocumentTools:
                     "STEP/STL/... file."
                 )
             title = self.plm.title_of(self.conn.active_object())
+            details = self._describe_save_target()
+            if preview:
+                return (
+                    f"Preview, nothing saved: saving would propagate '{title}'{details} and "
+                    "the modified content loaded in its editor to the shared 3DEXPERIENCE "
+                    "database, under your name. Call again without preview to save."
+                )
             self.plm.propagate()
-            return f"Saved '{title}' (active editor content) to the 3DEXPERIENCE database."
+            return (
+                f"Saved '{title}'{details} (active editor content) to the 3DEXPERIENCE "
+                "database."
+            )
+        if preview:
+            doc = self.conn.active_document
+            where = file_path or str(safe_get(doc, "FullName", "") or "its current file")
+            return f"Preview, nothing saved: would write '{com_name(doc)}' to {where}."
         doc = self.conn.active_document
         # DisplayFileAlerts=False: an overwrite / "save in a newer level"
         # prompt would otherwise block SaveAs/Save, and the worker with it.
@@ -633,7 +690,9 @@ class DocumentTools:
         app = self.conn.app
         windows = list(iter_items(app.Windows))
         captions = [str(safe_get(w, "Caption", "")) for w in windows]
-        exact = [w for w, c in zip(windows, captions) if c == name]
+        exact = [w for w, c in zip(windows, captions) if c == name] or [
+            w for w, c in zip(windows, captions) if c.lower() == name.lower()
+        ]
         matches = exact or [w for w, c in zip(windows, captions) if name.lower() in c.lower()]
         if not matches:
             raise ObjectNotFound(
@@ -646,4 +705,9 @@ class DocumentTools:
                 + ". Pass more of the caption."
             )
         matches[0].Activate()
-        return f"Window '{safe_get(matches[0], 'Caption', name)}' activated."
+        caption = safe_get(matches[0], "Caption", name)
+        # Name what is now in front, so the next write can be checked against
+        # it (pass the id as target_id): a partial caption match can land on
+        # a window the caller did not mean (field report 2026-11-02).
+        how = "" if exact else f" (partial match of '{name}': check it is the intended one)"
+        return f"Window '{caption}' activated{how}{self._describe_save_target()}."

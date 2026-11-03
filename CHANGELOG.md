@@ -37,6 +37,48 @@ All notable changes to this project are documented here.
   API search and undo/redo (`EYES` rows for a human to confirm), and a
   per-tool PASS/FAIL table.
 
+- **Field report 2026-11-02 (first real use on R428 SP6).** Recipes that
+  worked live through `catia_run_python` are now built in:
+  - Drafting: `catia_drawing_set_sheet` (paper size, orientation,
+    projection), `catia_drawing_move_view`, `catia_drawing_move_dimension`,
+    `catia_drawing_delete_dimension`, `catia_drawing_set_dimension_text`,
+    `catia_drawing_set_table_cell`, `catia_drawing_edit_text`,
+    `catia_drawing_link_attribute` (title block cell -> part attribute such
+    as the EIN `V_PartNumber`; says clearly when it is still empty) and
+    `catia_drawing_apply_template` (copy a database template's background,
+    title block and revision table). `catia_new_drawing` takes paper size,
+    orientation and projection.
+  - `catia_hole` threads: `thread_standard`, `designation` (e.g. M6),
+    `thread_depth`, `through_all`; read back, tap drill reported.
+  - Rectangle sketches add length constraints (`dimensions`, default on) so
+    drawings can generate them.
+  - 3D Part creation learns the site's part type: from a previously working
+    type (`plm_types.json`), `CATIA_MCP_PART_TYPE`, or the customized type of
+    any 3D Part open in CATIA; same for Physical Products
+    (`CATIA_MCP_PRODUCT_TYPE`). `catia_new_part` accepts any type name.
+  - PLM attribute tools read/write the root 3D Part (`target`), including
+    `V_PartNumber`; `catia_assign_part_number` sets or requests an EIN
+    (unverified on R428).
+  - `catia_run_python` helpers for ByRef/array out-parameters:
+    `fill_array`, `out_values`, `out_object`, `vbscript`.
+  - `scripts/probe_3dx.py`: read-only probe of the site's PLM types, EIN
+    attributes and API docs, to settle what automation may create.
+- **Write guard** (the report's safety review): modifying tools refuse
+  content owned by another user or Frozen/Released/Obsolete
+  (`WRITE_PROTECTED`, override `allow_protected_write`), accept `target_id`
+  and refuse when another window is in front (`TARGET_MISMATCH`);
+  `catia_run_python` is guarded and reports Delete/Save/Paste calls;
+  `catia_save_document` has `preview` and names what it writes;
+  `catia_activate_document` reports partial matches and the activated
+  object's id, owner and maturity; `catia_status` shows `write_target`.
+  Drafting tools tell the guard which drawing they really write
+  (`write_target`), close-with-save and view-regenerating dimension
+  listings are guarded, export is not. The 3DEXPERIENCE login is learned
+  from content the server creates (`plm_login.txt`; `CATIA_MCP_USER`
+  overrides) and owners match across DOMAIN\\user / user@domain forms.
+- `catia-mcp update` (and `--check`): reinstall the newest commit of the
+  installed branch; the installer closes and reopens Claude Desktop.
+
 ### Changed
 - The server attaches only to a running CATIA; tools fail with
   `CATIA_NOT_RUNNING` until it is started, and reattach by themselves after
@@ -70,6 +112,17 @@ All notable changes to this project are documented here.
   refusals persist on disk for 30 days (`plm_refusals.json` in the state
   folder), so the dialog appears at most once per machine. A refused
   Physical Product is not retried either.
+- 3DEXPERIENCE fillets: `AddNewSolidEdgeFilletWithConstantRadius` failed
+  on every edge reference; edges now come from the field-proven
+  `Topology.CGMEdge` search, shared by `catia_list_edges` (12 edges on a box,
+  not 16) and `catia_fillet`.
+- `catia_drawing_generate_dimensions` honours `view_name`, reports every
+  dimension it created on every view, drops hole internals (drill-point
+  angle, tap drill, duplicate depths) by default, and angles are degrees.
+- Section views no longer end in '-'; projection views name the sheet's
+  projection method. A failed hole reports its sketch points (CATIA deletes
+  the absorbed sketch with it); a smooth hole resets threads carried over
+  from the previous hole.
 - Fillet, chamfer, pad, shaft, groove and hole delete a feature whose update
   fails (`FEATURE_UPDATE_FAILED`) instead of leaving it broken in the tree;
   inputs are validated first.

@@ -27,7 +27,7 @@ from typing import Any
 from catia_mcp.automation import call_fill_array, safe_get
 from catia_mcp.connection import PLATFORM_3DX, CATIAConnection
 from catia_mcp.errors import UnsupportedCapability, after_mutation
-from catia_mcp.plm import PLMCreateRefused, PLMSession
+from catia_mcp.plm import PLMSession
 
 
 def compose_position(
@@ -93,11 +93,12 @@ class AssemblyTools:
                 "name": "catia_add_new_part",
                 "description": (
                     "Create a new empty Part directly inside the active assembly. "
-                    "3DEXPERIENCE: creates a 3D Part (licence/role permitting) and pastes "
-                    "it under the active product, verified by the child count; the new "
-                    "part's own editor stays open for modeling. Where the site refuses "
-                    "scripted 3D Part creation this fails fast with UNSUPPORTED_CAPABILITY "
-                    "(a 3D Shape cannot be pasted as a component); insert an existing "
+                    "3DEXPERIENCE: creates a 3D Part (the site's customized part type "
+                    "when one was learned, see catia_new_part) and pastes it under the "
+                    "active product, verified by the child count; the new part's own "
+                    "editor stays open for modeling. Where the site refuses scripted 3D "
+                    "Part creation this fails fast with UNSUPPORTED_CAPABILITY (a 3D "
+                    "Shape cannot be pasted as a component); insert an existing "
                     "part with catia_insert_existing_component instead."
                 ),
                 "inputSchema": {
@@ -327,17 +328,6 @@ class AssemblyTools:
     def _add_new_part(self, name: str | None = None) -> str:
         if self.conn.is_3dx:
             self.conn.ensure_connected()
-            cached = self.plm.refused("3DPart")
-            if cached is not None:
-                # Same per-connection refusal cache as catia_new_part: do not
-                # ask CATIA again for something it refused this session.
-                raise UnsupportedCapability(
-                    f"3DEXPERIENCE refused to create a 3D Part earlier in this session "
-                    f"({cached}), so no new part can be pasted into the assembly. "
-                    "Insert an existing part with catia_insert_existing_component, or "
-                    "create the part in the CATIA UI. Reconnect to retry after a role "
-                    "change."
-                )
             return self._paste_under_root(self._create_3d_part, name, "new 3D Part", close_source=False)
         product = self.conn.get_active_product()
         products = product.Products
@@ -348,15 +338,16 @@ class AssemblyTools:
         return f"New Part component created in assembly: '{new_product.Name}'"
 
     def _create_3d_part(self) -> None:
+        # Same type order and on-disk refusal cache as catia_new_part 'auto'
+        # (remembered type, CATIA_MCP_PART_TYPE, customized types of open 3D
+        # Parts, '3DPart'), but without the 3D Shape fallback: no paste recipe
+        # for a 3D Shape is field-proven, so fail fast (nothing pasted yet).
         try:
-            self.plm.create("3DPart")
-        except PLMCreateRefused as refusal:
-            # No paste recipe for a 3D Shape is field-proven, so fail fast
-            # instead of falling back (nothing was pasted yet).
+            self.plm.create_part("auto", shape_fallback=False)
+        except UnsupportedCapability as refusal:
             raise UnsupportedCapability(
-                f"3DEXPERIENCE refused to create a 3D Part ({refusal.reason}), so no new "
-                "part can be pasted into the assembly. Insert an existing part with "
-                "catia_insert_existing_component, or create the part in the CATIA UI.",
+                f"{refusal} No new part can be pasted into the assembly; insert an "
+                "existing part with catia_insert_existing_component instead.",
                 modified=refusal.modified,
             ) from refusal
 

@@ -33,6 +33,10 @@
 .PARAMETER Python
     Python version uv installs for the tool. Default: 3.13.
 
+.PARAMETER NoRestartClaude
+    Do not close and reopen a running Claude Desktop (by default it is
+    restarted so it picks up the new server; chats are kept).
+
 .PARAMETER Uninstall
     Stop the service, remove the autostart and the Claude client entries,
     then remove the tool.
@@ -54,6 +58,7 @@ param(
     [int]$Port = 8765,
     [switch]$NoClients,
     [string]$Python = '3.13',
+    [switch]$NoRestartClaude,
     [switch]$Uninstall
 )
 
@@ -173,6 +178,58 @@ function Stop-ToolProcesses {
     if ($procs.Count -gt 0) { Start-Sleep -Seconds 1 }
 }
 
+function Get-ClaudeDesktopProcesses {
+    # Claude Desktop only: the Claude Code CLI is also claude.exe (in
+    # .local\bin or node_modules) and must never be closed, so match by the
+    # Desktop app's install folders (Microsoft Store package or the classic
+    # per-user install).
+    try {
+        return @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+            $_.Name -ieq 'claude.exe' -and $_.ExecutablePath -and (
+                $_.ExecutablePath -like '*\WindowsApps\*Claude*' -or
+                $_.ExecutablePath -like '*\AnthropicClaude\*' -or
+                $_.ExecutablePath -like '*\Programs\Claude\*'
+            )
+        })
+    } catch {
+        return @()
+    }
+}
+
+function Close-ClaudeDesktop {
+    # The update must stop the `catia-mcp proxy` Claude Desktop launched
+    # (Windows will not replace files in use), and Desktop does not reconnect
+    # to a stopped server by itself, so it is closed here and reopened after
+    # the install. Chats live in the Claude account, not in the process.
+    # @(...): a function returning an empty array yields $null to the caller,
+    # and $null.Count throws under Set-StrictMode on Windows PowerShell 5.1.
+    $procs = @(Get-ClaudeDesktopProcesses)
+    if ($procs.Count -eq 0) { return $false }
+    Write-Step 'Closing Claude Desktop for the update (it reopens when done; chats are kept)'
+    foreach ($p in $procs) {
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 2
+    $script:ClaudeClosed = $true
+    return $true
+}
+
+function Start-ClaudeDesktop {
+    # Get-StartApps resolves both the Store build (AUMID) and the classic
+    # Start-menu entry; shell:AppsFolder launches either.
+    try {
+        $app = Get-StartApps -ErrorAction Stop | Where-Object { $_.Name -eq 'Claude' } | Select-Object -First 1
+    } catch {
+        $app = $null
+    }
+    if ($app) {
+        Start-Process "shell:AppsFolder\$($app.AppID)"
+        Write-Note 'Claude Desktop reopened with the updated "catia" server.'
+        return
+    }
+    Write-Warn 'Could not find Claude Desktop in the Start menu; open it yourself.'
+}
+
 function Get-PackageSpec {
     # A git URL tracks the branch's latest commit; without git on the machine
     # (common on managed laptops) the GitHub source archive works the same.
@@ -190,6 +247,10 @@ function Invoke-Install {
     # Corporate proxies re-sign TLS traffic with a company root certificate
     # that lives in the Windows store; native TLS makes uv trust it.
     if (-not $env:UV_NATIVE_TLS) { $env:UV_NATIVE_TLS = '1' }
+
+    if (-not $NoClients -and -not $NoRestartClaude) {
+        $null = Close-ClaudeDesktop
+    }
 
     $existing = Find-CatiaMcp $uv
     if ($existing) {
@@ -228,7 +289,12 @@ function Invoke-Install {
     Write-Host ''
     Write-Host 'Done.' -ForegroundColor Green
     Write-Note "Endpoint: http://127.0.0.1:$Port/mcp   Health: http://127.0.0.1:$Port/health"
-    Write-Note 'Restart Claude Desktop (quit it from the tray icon) so it loads the "catia" server.'
+    if ($script:ClaudeClosed) {
+        $script:ClaudeClosed = $false
+        Start-ClaudeDesktop
+    } else {
+        Write-Note 'Open (or restart) Claude Desktop so it loads the "catia" server.'
+    }
     Write-Note 'Start CATIA (and log in, on 3DEXPERIENCE); the server attaches on the first tool call.'
 }
 
@@ -252,12 +318,15 @@ function Invoke-Uninstall {
     Write-Host 'Uninstalled. Logs remain in %LOCALAPPDATA%\catia-mcp (delete the folder if unwanted).' -ForegroundColor Green
 }
 
+$script:ClaudeClosed = $false
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     if ($Uninstall) { Invoke-Uninstall } else { Invoke-Install }
 } catch {
     Write-Host ''
     Write-Host "Install failed: $($_.Exception.Message)" -ForegroundColor Red
+    # Never leave the user without the Claude Desktop we closed.
+    if ($script:ClaudeClosed) { Start-ClaudeDesktop }
     Write-Host 'Troubleshooting: docs/background-service.md (https://github.com/friessssss/catia-v5-mcp-server/blob/main/docs/background-service.md)'
     # `exit` would close the user's window when the script runs through
     # `irm | iex`; only a script file run (install.cmd, -File) gets an exit code.

@@ -29,7 +29,7 @@ jobs:
         # Limited to the new modules so legacy findings elsewhere do not fail
         # the build; widen the list as files are cleaned up.
         run: >-
-          ruff check catia_mcp/service.py catia_mcp/proxy.py catia_mcp/paths.py catia_mcp/com_thread.py
+          ruff check catia_mcp/service.py catia_mcp/proxy.py catia_mcp/paths.py catia_mcp/com_thread.py catia_mcp/guard.py
           catia_mcp/winutil.py scripts/live_smoke_test.py tests/test_packaging.py
 
       - name: Run offline test suite

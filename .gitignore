@@ -15,3 +15,6 @@ gsd_smoke_test.jpg
 
 # Live smoke test reports
 smoke_report.json
+
+# Field reports from live sessions hold company data: keep them local.
+docs/field-reports/
