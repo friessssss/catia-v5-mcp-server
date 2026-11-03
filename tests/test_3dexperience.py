@@ -88,7 +88,13 @@ def test_platform_environment_variable(monkeypatch):
 def test_cli_platform_and_scripts_flags():
     args = parse_args(["--platform", "3dx", "--allow-scripts"])
     assert args.platform == "3dx" and args.allow_scripts is True
-    assert parse_args([]).allow_scripts is False
+    # Local agents get scripting by default (stdio, loopback HTTP); a server
+    # reachable from the network needs the explicit opt-in.
+    assert parse_args([]).allow_scripts is True
+    assert parse_args(["serve"]).allow_scripts is True
+    assert parse_args(["serve", "--host", "0.0.0.0"]).allow_scripts is False
+    assert parse_args(["serve", "--host", "0.0.0.0", "--allow-scripts"]).allow_scripts is True
+    assert parse_args(["--no-scripts"]).allow_scripts is False
     with pytest.raises(SystemExit):
         parse_args(["--platform", "nope"])
 

@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import hmac
 import ipaddress
+import json
 import logging
 import secrets
+from collections.abc import Callable
 from typing import Any
 
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -33,6 +35,7 @@ logger = logging.getLogger("catia_mcp.http")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 MCP_PATH = "/mcp"
+HEALTH_PATH = "/health"
 
 
 def is_loopback(host: str) -> bool:
@@ -67,6 +70,17 @@ def security_settings(host: str, port: int) -> TransportSecuritySettings:
     return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
+async def _send_json(send: Any, status: int, payload: dict[str, Any]) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [(b"content-type", b"application/json")],
+        }
+    )
+    await send({"type": "http.response.body", "body": json.dumps(payload).encode()})
+
+
 async def _send_status(send: Any, status: int, message: bytes) -> None:
     await send(
         {
@@ -81,10 +95,26 @@ async def _send_status(send: Any, status: int, message: bytes) -> None:
     await send({"type": "http.response.body", "body": message})
 
 
-def build_app(mcp_server: Any, host: str, port: int, token: str | None) -> Any:
-    """Return an ASGI app exposing the MCP server at /mcp."""
+def build_app(
+    mcp_server: Any,
+    host: str,
+    port: int,
+    token: str | None,
+    status: Callable[[], dict[str, Any]] | None = None,
+) -> Any:
+    """Return an ASGI app exposing the MCP server at /mcp and a health probe
+    at /health.
+
+    Sessions are stateless with plain JSON responses: every request stands
+    alone, so restarting the server (or CATIA) never strands a client on an
+    expired session id, and simple bridges (catia-mcp proxy) can relay
+    requests one POST at a time. The tools need no server-to-client
+    requests, which is all stateless mode gives up."""
     manager = StreamableHTTPSessionManager(
-        app=mcp_server, security_settings=security_settings(host, port)
+        app=mcp_server,
+        json_response=True,
+        stateless=True,
+        security_settings=security_settings(host, port),
     )
     expected = f"Bearer {token}".encode() if token else None
 
@@ -102,8 +132,8 @@ def build_app(mcp_server: Any, host: str, port: int, token: str | None) -> Any:
             return
         if scope["type"] != "http":
             return
-        path = scope.get("path", "")
-        if path.rstrip("/") != MCP_PATH:
+        path = scope.get("path", "").rstrip("/")
+        if path not in (MCP_PATH, HEALTH_PATH):
             await _send_status(send, 404, b"Not found. The MCP endpoint is /mcp.")
             return
         if expected is not None:
@@ -113,19 +143,34 @@ def build_app(mcp_server: Any, host: str, port: int, token: str | None) -> Any:
                 logger.warning("Rejected unauthenticated request from %s", scope.get("client"))
                 await _send_status(send, 401, b"Missing or invalid bearer token.")
                 return
+        if path == HEALTH_PATH:
+            await _send_json(send, 200, status() if status else {"status": "ok"})
+            return
         await manager.handle_request(scope, receive, send)
 
     return app
 
 
-async def serve(mcp_server: Any, host: str, port: int, token: str | None) -> None:
+async def serve(
+    mcp_server: Any,
+    host: str,
+    port: int,
+    token: str | None,
+    status: Callable[[], dict[str, Any]] | None = None,
+) -> None:
     import uvicorn
 
     check_bind(host, token)
-    app = build_app(mcp_server, host, port, token)
+    app = build_app(mcp_server, host, port, token, status)
     shown = "set" if token else "none (loopback only)"
     logger.info("Serving MCP over HTTP at http://%s:%d%s (token: %s)", host, port, MCP_PATH, shown)
-    config = uvicorn.Config(app, host=host, port=port, log_level="info", lifespan="on")
+    # log_config=None keeps uvicorn on the root logger (our rotating file);
+    # its default config writes to a console that pythonw.exe does not have.
+    # /health is polled by clients and `catia-mcp status`; keep it out of the log.
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    config = uvicorn.Config(
+        app, host=host, port=port, log_level="info", lifespan="on", log_config=None
+    )
     await uvicorn.Server(config).serve()
 
 

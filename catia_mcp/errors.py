@@ -49,6 +49,10 @@ class PermissionDenied(CATIAToolError):
     code = "PERMISSION_DENIED"
 
 
+class CATIANotRunning(CATIAToolError):
+    code = "CATIA_NOT_RUNNING"
+
+
 @contextmanager
 def after_mutation():
     """Wrap code that runs after CATIA was already changed: a typed failure

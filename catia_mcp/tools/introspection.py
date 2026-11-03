@@ -13,13 +13,18 @@ CATIA_MCP_ALLOW_SCRIPTS=1), because a script can do anything the user can.
 
 from __future__ import annotations
 
+import ast
+import contextlib
+import io
 import json
+import math
 import re
+import traceback
 from typing import Any
 
 from catia_mcp.automation import evaluate, get_member
 from catia_mcp.connection import CATIAConnection
-from catia_mcp.errors import InvalidArgument, ObjectNotFound, PermissionDenied
+from catia_mcp.errors import CATIAToolError, InvalidArgument, ObjectNotFound, PermissionDenied
 from catia_mcp.introspect import describe_members, find_enum, list_enums, type_name
 
 # Getter-like methods allowed in an inspection path; no other call is made.
@@ -30,6 +35,7 @@ _ALLOWED_CALLS = {
 }
 _SEGMENT = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)(?:\((?:(-?\d+)|"([^"]*)")?\))?')
 _ROOTS = ("app", "editor", "document", "part", "product", "selection", "window")
+_MAX_OUTPUT = 40_000
 
 
 def _parse_path(path: str) -> list[tuple[str, bool, Any]]:
@@ -64,12 +70,20 @@ def _jsonable(value: Any, depth: int = 0) -> Any:
     return str(value)
 
 
+def _clip(text: str) -> str:
+    if len(text) <= _MAX_OUTPUT:
+        return text
+    return text[:_MAX_OUTPUT] + f"\n... ({len(text) - _MAX_OUTPUT} more characters cut)"
+
+
 class IntrospectionTools:
     """Read-only API inspection and opt-in script execution."""
 
     def __init__(self, connection: CATIAConnection, allow_scripts: bool = False) -> None:
         self.conn = connection
         self.allow_scripts = allow_scripts
+        # Survives between catia_run_python calls (like a notebook kernel).
+        self._session: dict[str, Any] = {}
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
         return [
@@ -106,6 +120,32 @@ class IntrospectionTools:
                         },
                     },
                     "required": ["path"],
+                },
+            },
+            {
+                "name": "catia_run_python",
+                "description": (
+                    "Run Python inside the server against the live CATIA automation API "
+                    "(the escape hatch for anything no dedicated tool covers - like "
+                    "Fusion's script execution). Predefined names: catia (the "
+                    "Application), conn (connection helpers), platform ('v5'/'3dx'), "
+                    "part(), body(), document(), editor(), product(), selection() "
+                    "(resolve lazily, raise if absent), win32com, math, json, and "
+                    "session (a dict kept between calls). Print to report, or set "
+                    "`result` (or end with an expression) to return a value. COM "
+                    "objects print as their type. Calls run on CATIA's thread, so keep "
+                    "loops bounded; call part().Update() after changes and verify with a "
+                    "measurement or catia_screenshot. Use catia_inspect_api / "
+                    "catia_api_search to find member names. Example: "
+                    "\"p = part(); print([b.Name for b in p.Bodies])\". Requires scripts "
+                    "to be enabled (default for local use)."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "Python source to run"},
+                    },
+                    "required": ["code"],
                 },
             },
             {
@@ -146,6 +186,8 @@ class IntrospectionTools:
                 return self._inspect(arguments)
             case "catia_run_script":
                 return self._run_script(arguments)
+            case "catia_run_python":
+                return self._run_python(arguments)
             case _:
                 raise ValueError(f"Unknown introspection tool: {tool_name}")
 
@@ -216,13 +258,91 @@ class IntrospectionTools:
             result["members"] = members
         return json.dumps(result, indent=2, ensure_ascii=False)
 
-    def _run_script(self, args: dict[str, Any]) -> str:
+    def _require_scripts(self, tool: str) -> None:
         if not self.allow_scripts:
             raise PermissionDenied(
-                "catia_run_script is disabled. Restart the server with --allow-scripts "
-                "(or set CATIA_MCP_ALLOW_SCRIPTS=1) to enable it; scripts run with your "
-                "full rights in CATIA and on this machine."
+                f"{tool} is disabled on this server (it was started with --no-scripts, "
+                "CATIA_MCP_ALLOW_SCRIPTS=0, or listens beyond this machine without "
+                "--allow-scripts). Scripts run with the user's full rights in CATIA and "
+                "on the machine."
             )
+
+    def _namespace(self) -> dict[str, Any]:
+        conn = self.conn
+
+        def document() -> Any:
+            return conn.active_document
+
+        def editor() -> Any:
+            return conn.active_editor
+
+        namespace: dict[str, Any] = {
+            "catia": conn.app,
+            "app": conn.app,
+            "conn": conn,
+            "platform": conn.platform,
+            "part": conn.get_active_part,
+            "body": conn.get_active_part_body,
+            "product": conn.get_active_product,
+            "document": document,
+            "editor": editor,
+            "selection": lambda: conn.hso,
+            "math": math,
+            "json": json,
+            "session": self._session,
+            "__name__": "__catia__",
+        }
+        try:
+            import win32com.client
+
+            namespace["win32com"] = win32com
+        except ImportError:
+            pass
+        return namespace
+
+    def _run_python(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_scripts("catia_run_python")
+        self.conn.ensure_connected()
+        code = args["code"]
+        try:
+            tree = ast.parse(code, "<catia_run_python>", "exec")
+        except SyntaxError as error:
+            raise InvalidArgument(f"Python syntax error: {error}") from error
+        tail = None
+        if tree.body and isinstance(tree.body[-1], ast.Expr):
+            tail = ast.Expression(tree.body.pop().value)
+        namespace = self._namespace()
+        out = io.StringIO()
+        value: Any = None
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            try:
+                exec(compile(tree, "<catia_run_python>", "exec"), namespace)  # noqa: S102 -- opt-in tool
+                if tail is not None:
+                    value = eval(compile(tail, "<catia_run_python>", "eval"), namespace)  # noqa: S307
+            except Exception as error:  # noqa: BLE001 -- reported with traceback
+                printed = _clip(out.getvalue())
+                trace = traceback.format_exc(limit=-6)
+                raise CATIAToolError(
+                    f"{type(error).__name__}: {error}\n\nOutput before the error:\n"
+                    f"{printed or '(none)'}\n\nTraceback:\n{_clip(trace)}",
+                    code="SCRIPT_ERROR",
+                    modified=None,
+                ) from error
+        if "result" in namespace:
+            value = namespace["result"]
+        from catia_mcp.results import operation_result
+
+        return operation_result(
+            tool="catia_run_python",
+            ok=True,
+            code="OK",
+            message=_clip(out.getvalue()) or "(no output)",
+            data={"result": _jsonable(value), "stdout": _clip(out.getvalue())},
+            modified=None,
+        )
+
+    def _run_script(self, args: dict[str, Any]) -> str:
+        self._require_scripts("catia_run_script")
         self.conn.ensure_connected()
         function = args.get("function") or "CATMain"
         if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", function):

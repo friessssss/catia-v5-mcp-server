@@ -26,6 +26,7 @@ from typing import Any
 
 from catia_mcp.automation import get_member, iter_items, name_exists, resolves, safe_get
 from catia_mcp.errors import (
+    CATIANotRunning,
     InvalidArgument,
     NoActiveDocument,
     ObjectNotFound,
@@ -42,6 +43,15 @@ try:
     HAS_COM = True
 except ImportError:
     HAS_COM = False
+
+# HRESULTs meaning the CATIA process behind a proxy is gone or unreachable.
+_LOST_HRESULTS = {
+    -2147023174,  # RPC_S_SERVER_UNAVAILABLE 0x800706BA
+    -2147023170,  # RPC_S_CALL_FAILED 0x800706BE
+    -2147417848,  # RPC_E_DISCONNECTED 0x80010108
+    -2147220995,  # CO_E_OBJNOTCONNECTED 0x800401FD
+    -2147023169,  # RPC_S_CALL_FAILED_DNE 0x800706BF
+}
 
 PLATFORM_V5 = "v5"
 PLATFORM_3DX = "3dx"
@@ -68,8 +78,14 @@ class CATIAConnection:
     # Both CATIA V5 and 3DEXPERIENCE register this ProgID.
     CATIA_PROGID = "CATIA.Application"
 
-    def __init__(self, platform: str | None = None) -> None:
+    def __init__(self, platform: str | None = None, launch: bool | None = None) -> None:
         self.app: Any | None = None
+        # Launching CATIA from a tool call is opt-in: a background service
+        # should attach to the CATIA the user started (and logged in to, on
+        # 3DEXPERIENCE), not spawn an invisible second session.
+        if launch is None:
+            launch = os.environ.get("CATIA_MCP_LAUNCH", "").strip().lower() in {"1", "true", "yes", "on"}
+        self.launch = launch
         self._initialized_com = False
         self._forced_platform = normalize_platform(
             platform if platform is not None else os.environ.get("CATIA_MCP_PLATFORM")
@@ -130,7 +146,16 @@ class CATIAConnection:
             version = self._get_version()
             logger.info("Connected to running %s instance (%s)", self.platform_label, version)
             return f"Connected to running {self.platform_label} instance ({version})"
-        except Exception:
+        except Exception as error:
+            self.app = None
+            self.platform = None
+            if not self.launch:
+                raise CATIANotRunning(
+                    "CATIA is not running (or not registered for automation in this "
+                    "Windows session). Start CATIA V5 or 3DEXPERIENCE (and log in), then "
+                    "retry: the server attaches automatically. To let tool calls launch "
+                    f"CATIA instead, set CATIA_MCP_LAUNCH=1. ({error})"
+                ) from error
             logger.info("No running CATIA instance found, launching new one...")
 
         # Phase 2: Launch a new CATIA instance
@@ -170,6 +195,15 @@ class CATIAConnection:
                 pass
             self._initialized_com = False
         return "Disconnected from CATIA"
+
+    @staticmethod
+    def lost(error: BaseException) -> bool:
+        """True when a COM error means CATIA itself went away."""
+        hresult = getattr(error, "hresult", None)
+        if hresult is None and getattr(error, "args", None):
+            first = error.args[0]
+            hresult = first if isinstance(first, int) else None
+        return hresult in _LOST_HRESULTS
 
     def ensure_connected(self) -> None:
         """Ensure we have an active CATIA connection, connecting if needed."""
