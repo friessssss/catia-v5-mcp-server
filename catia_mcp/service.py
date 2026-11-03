@@ -270,17 +270,23 @@ def autostart_command() -> str | None:
 
 
 def claude_desktop_configs() -> list[Path]:
-    """claude_desktop_config.json locations of installed Claude Desktop apps
-    (classic installer and the Microsoft Store / MSIX package)."""
+    """claude_desktop_config.json files to write for Claude Desktop.
+
+    On Windows the classic location %APPDATA%\\Claude is always included
+    (created if needed): the installer must not depend on Claude Desktop
+    having run before, and a Microsoft Store (MSIX) build reads it too when
+    it has no private copy. Every Store package whose name contains
+    "Claude" adds its private LocalCache copy (live laptop: the package was
+    not named Claude_*, so nothing was written)."""
     found: list[Path] = []
     appdata = os.environ.get("APPDATA")
-    if appdata and Path(appdata, "Claude").is_dir():
+    if appdata and (sys.platform == "win32" or Path(appdata, "Claude").is_dir()):
         found.append(Path(appdata, "Claude", "claude_desktop_config.json"))
     local = os.environ.get("LOCALAPPDATA")
     if local:
         packages = Path(local, "Packages")
         if packages.is_dir():
-            for package in packages.glob("Claude_*"):
+            for package in sorted(packages.glob("*Claude*")):
                 roaming = package / "LocalCache" / "Roaming" / "Claude"
                 if roaming.is_dir():
                     found.append(roaming / "claude_desktop_config.json")
@@ -311,6 +317,7 @@ def update_desktop_config(path: Path, entry: dict[str, Any] | None) -> str:
             except ValueError:
                 return f"{path}: not valid JSON, left unchanged. Add the entry by hand."
         shutil.copyfile(path, path.with_suffix(".json.bak"))
+    path.parent.mkdir(parents=True, exist_ok=True)
     servers = data.setdefault("mcpServers", {})
     if entry is None:
         if servers.pop(SERVER_NAME, None) is None:

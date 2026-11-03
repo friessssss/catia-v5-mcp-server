@@ -160,10 +160,29 @@ def test_claude_desktop_configs_finds_classic_and_msix_installs(tmp_path, monkey
     ]
 
 
-def test_claude_desktop_configs_empty_without_claude(tmp_path, monkeypatch):
+def test_claude_desktop_configs_always_include_appdata_on_windows(tmp_path, monkeypatch):
+    # Live laptop: Claude Desktop installed, but no folder matched, so the
+    # entry was never written. The classic path is now always configured.
+    appdata = tmp_path / "a"
+    local = tmp_path / "b"
+    store = local / "Packages" / "AnthropicPBC.Claude_abc123" / "LocalCache" / "Roaming" / "Claude"
+    store.mkdir(parents=True)
+    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    monkeypatch.setattr(sys, "platform", "win32")
+    found = service.claude_desktop_configs()
+    assert found == [
+        appdata / "Claude" / "claude_desktop_config.json",
+        store / "claude_desktop_config.json",
+    ]
+    service.update_desktop_config(found[0], service.proxy_entry())
+    assert "catia" in found[0].read_text(encoding="utf-8")
+
+
+def test_claude_desktop_configs_empty_off_windows_without_claude(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path / "a"))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "b"))
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "platform", "linux")
     assert service.claude_desktop_configs() == []
 
 
