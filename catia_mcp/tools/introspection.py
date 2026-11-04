@@ -76,6 +76,48 @@ def _jsonable(value: Any, depth: int = 0) -> Any:
     return str(value)
 
 
+# Method names that can modify a CATIA model, document or session.
+_MUTATING_CALL = re.compile(
+    r"^(Add|New|Set|Put|Delete|Remove|Update|Paste|Cut|Save|Close|Insert|Move|Create|"
+    r"Reverse|Rename|Modify|Replace|Apply|Activate|Start|Invoke|Propagate|PLM|Import|"
+    r"Export|Print|Swap|Change|Clear|Append|Resize|Merge|Split|Drop|Reset|Refresh|"
+    r"Run|Execute|Evaluate)",
+    re.IGNORECASE,
+)
+# Helpers that run arbitrary code or out-parameter calls inside CATIA.
+_OPAQUE_CALLS = {"vbscript", "out_values", "out_object", "fill_array", "exec", "eval",
+                 "setattr", "delattr", "__import__", "compile"}
+
+
+def _looks_read_only(tree: ast.AST) -> bool:
+    """True when a script assigns no attribute or item and calls nothing
+    that can change CATIA. A static, conservative check: anything doubtful
+    counts as a possible write (catia_run_python then reports modified=null)."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+            targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
+            for target in targets:
+                for sub in ast.walk(target):
+                    if isinstance(sub, (ast.Attribute, ast.Subscript)):
+                        if isinstance(sub.value, ast.Name) and sub.value.id in {"session", "result"}:
+                            continue  # the script's own scratch state
+                        return False
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name in _OPAQUE_CALLS or _MUTATING_CALL.match(name or ""):
+                if isinstance(func, ast.Attribute) and isinstance(func.value, (ast.List, ast.Dict)):
+                    continue
+                if name in {"append", "update", "setdefault", "clear"} and isinstance(
+                    func, ast.Attribute
+                ) and isinstance(func.value, ast.Name) and func.value.id not in {
+                    "catia", "app", "conn",
+                }:
+                    continue  # list/dict methods on plain Python variables
+                return False
+    return True
+
+
 def _clip(text: str) -> str:
     if len(text) <= _MAX_OUTPUT:
         return text
@@ -342,6 +384,7 @@ class IntrospectionTools:
             tree = ast.parse(code, "<catia_run_python>", "exec")
         except SyntaxError as error:
             raise InvalidArgument(f"Python syntax error: {error}") from error
+        read_only = _looks_read_only(tree)
         tail = None
         if tree.body and isinstance(tree.body[-1], ast.Expr):
             tail = ast.Expression(tree.body.pop().value)
@@ -371,8 +414,14 @@ class IntrospectionTools:
             ok=True,
             code="OK",
             message=_clip(out.getvalue()) or "(no output)",
-            data={"result": _jsonable(value), "stdout": _clip(out.getvalue())},
-            modified=None,
+            data={
+                "result": _jsonable(value),
+                "stdout": _clip(out.getvalue()),
+                "read_only_detected": read_only,
+            },
+            # False only when the code makes no attribute assignment and no
+            # call that can modify CATIA (static check); otherwise unknown.
+            modified=False if read_only else None,
         )
 
     def _run_script(self, args: dict[str, Any]) -> str:

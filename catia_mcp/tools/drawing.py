@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import time
 from typing import Any, ClassVar
 
 from catia_mcp.automation import (
@@ -147,6 +149,138 @@ _SHEET_PROPERTIES: dict[str, Any] = {
     },
     "scale": {"type": "number", "description": "Sheet scale, e.g. 1 for 1:1, 0.5 for 1:2"},
 }
+
+
+# Paper sizes in mm as (short side, long side) per CatPaperSize value, for
+# sheets whose GetPaperWidth / GetPaperHeight cannot be read. ISO 216 and
+# ANSI sizes; the enum values are the ones in _PAPER_SIZES above.
+_PAPER_MM: dict[int, tuple[float, float]] = {
+    0: (215.9, 279.4), 1: (215.9, 355.6), 2: (841.0, 1189.0), 3: (594.0, 841.0),
+    4: (420.0, 594.0), 5: (297.0, 420.0), 6: (210.0, 297.0), 8: (279.4, 431.8),
+}
+
+# In-plane axes of each projection plane as DefineFrontView receives them:
+# (horizontal on the sheet, vertical on the sheet). From _PLANE_VECTORS:
+# zx = (0,0,1 | 1,0,0) puts the part's Z axis HORIZONTAL (field report
+# 2026-11-03: the ZX front view came out rotated); yz keeps Z vertical.
+_PLANE_AXES = {"xy": ("x", "y"), "yz": ("y", "z"), "zx": ("z", "x")}
+
+# Where annotation x / y are measured (catia_drawing_add_text, add_table,
+# edit_text).
+_COORDS_PROPERTY = {
+    "type": "string",
+    "enum": ["view", "sheet"],
+    "description": (
+        "Frame of x / y. 'view' (default): view units, measured from the view's axis "
+        "origin (xAxisData, yAxisData) in model mm, i.e. sheet distance divided by the "
+        "view scale. NOT from the view's position (view.x / view.y), which can be "
+        "hundreds of mm away. 'sheet': paper mm from the sheet's lower-left corner; "
+        "converted with x_view = (sheet_x - xAxisData) / Scale (field-proven on R428 "
+        "SP6). On the Background view both frames coincide."
+    ),
+}
+
+
+def _axis_number(view: Any, member: str) -> float | None:
+    """A numeric view member that may surface as a property or a method."""
+    try:
+        value = getattr(view, member)
+        if callable(value):
+            value = value()
+        return float(value)
+    except Exception:
+        return None
+
+
+def _sheet_to_view(view: Any, sheet_x: float | None, sheet_y: float | None) -> tuple[
+    float | None, float | None, list[str]
+]:
+    """Convert sheet mm to the view units DrawingTexts.Add / DrawingTables.Add
+    and DrawingText.x / .y use.
+
+    Field-proven on R428 SP6 (field report 2026-11-04): these coordinates are
+    view units relative to the view's axis origin (xAxisData, yAxisData),
+    divided by the view scale: x = (sheet_x - xAxisData) / Scale. The view's
+    rotation (Angle) is NOT part of the proven formula; a rotated view only
+    gets a warning. Private helper: a shared drawing model module may provide
+    the same conversion later."""
+    notes: list[str] = []
+    scale = _axis_number(view, "Scale")
+    if scale is None or abs(scale) < 1e-12:
+        raise UnsupportedCapability(
+            f"View '{safe_get(view, 'Name', '?')}' has no readable Scale, so sheet "
+            "coordinates cannot be converted. Pass coords='view'."
+        )
+    out: list[float | None] = []
+    for value, member in ((sheet_x, "xAxisData"), (sheet_y, "yAxisData")):
+        if value is None:
+            out.append(None)
+            continue
+        origin = _axis_number(view, member)
+        if origin is None:
+            raise UnsupportedCapability(
+                f"View '{safe_get(view, 'Name', '?')}' exposes no {member} (axis origin), so "
+                "sheet coordinates cannot be converted on this release. Pass coords='view'."
+            )
+        out.append((float(value) - origin) / scale)
+    angle = _axis_number(view, "Angle")
+    if angle and abs(angle) > 1e-9:
+        notes.append(
+            f"The view is rotated ({math.degrees(angle):g} deg); the sheet-to-view conversion "
+            "ignores rotation (unverified for rotated views): check with catia_screenshot."
+        )
+    return out[0], out[1], notes
+
+
+def _coords_mode(args: dict[str, Any]) -> str:
+    mode = str(args.get("coords") or "view").strip().lower()
+    if mode not in ("view", "sheet"):
+        raise InvalidArgument(f"Unknown coords '{args.get('coords')}'. Use 'view' or 'sheet'.")
+    return mode
+
+
+def _up_axis_angle(plane: str, up_axis: Any, angle: Any) -> tuple[float | None, list[str]]:
+    """In-plane rotation (degrees) for catia_drawing_add_view, from up_axis.
+
+    Field-proven on R428 SP6 (field report 2026-11-03): a front view on ZX
+    shows the part's Z axis horizontal and angle=90 turned it upright. The
+    general rule (an axis that is horizontal in the plane becomes vertical
+    with a 90 deg rotation) follows from the plane vectors; whether it then
+    points up or down is unverified for other planes."""
+    notes: list[str] = []
+    horizontal, vertical = _PLANE_AXES[plane]
+    if up_axis is None or up_axis == "":
+        if angle is None and plane == "zx":
+            notes.append(
+                "Front view on ZX shows the part's Z axis HORIZONTAL (field report "
+                "2026-11-03). If Z should point up, recreate it with up_axis='z' (same as "
+                "angle=90) or rotate it."
+            )
+        return (float(angle) if angle is not None else None), notes
+    axis = str(up_axis).strip().lower()
+    if axis not in ("x", "y", "z"):
+        raise InvalidArgument(f"Unknown up_axis '{up_axis}'. Use 'x', 'y' or 'z'.")
+    if axis == vertical:
+        wanted = 0.0
+    elif axis == horizontal:
+        wanted = 90.0
+        notes.append(
+            f"up_axis='{axis}' on plane {plane.upper()}: rotated the view by 90 deg"
+            + (" (field-proven for ZX / Z up on R428 SP6)." if (plane, axis) == ("zx", "z") else
+               " (unverified for this plane: if the axis points down, pass angle=-90).")
+        )
+    else:
+        raise InvalidArgument(
+            f"up_axis '{axis}' is the viewing direction of plane {plane.upper()} (it is "
+            f"normal to the sheet). In-plane axes: {horizontal} (horizontal), {vertical} "
+            "(vertical)."
+        )
+    if angle is not None and abs(float(angle) - wanted) > 1e-9:
+        raise InvalidArgument(
+            f"angle={angle} contradicts up_axis='{axis}' (which needs angle={wanted:g}). "
+            "Pass one of them."
+        )
+    return wanted, notes
 
 
 class _Lazy:
@@ -262,7 +396,14 @@ class DraftingTools:
                     "that shows a hole (tap-drill pair, or drill-point angle "
                     "next to a diameter), 118/120 deg drill-point angles and "
                     "duplicates (same type and value). Angles are in degrees. Dimensions are not moved off "
-                    "the geometry: use catia_drawing_move_dimension."
+                    "the geometry: use catia_drawing_move_dimension. LIMITS (field report "
+                    "2026-11-03, R428 SP6): edges of generated views are NOT addressable by "
+                    "automation (a selection search returns generated items that resolve only to "
+                    "the view), so dimensions picked on model edges must be placed by the user in "
+                    "the CATIA UI; afterwards catia_drawing_set_dimension_frame / "
+                    "catia_drawing_set_dimension_text format them. Dimensions generated from 3D "
+                    "constraints land in the view parallel to the constraint, not necessarily the "
+                    "view asked for."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -317,7 +458,10 @@ class DraftingTools:
                     "sheet's projection method, which the result names: on a "
                     "first-angle sheet (R428 default) 'bottom' lands ABOVE the "
                     "parent and 'right' to its left. Switch with "
-                    "catia_drawing_set_sheet projection='third_angle'."
+                    "catia_drawing_set_sheet projection='third_angle'. Projection "
+                    "views follow the parent's orientation: fix a sideways front "
+                    "view (ZX plane, Z horizontal) with catia_drawing_add_view "
+                    "up_axis='z' before deriving views."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -407,16 +551,21 @@ class DraftingTools:
             {
                 "name": "catia_drawing_add_text",
                 "description": (
-                    "Add a text annotation to a drawing view at (x, y) mm in "
-                    "the view's coordinate system (DrawingTexts.Add). Use the "
-                    "sheet's Background view for title block text."
+                    "Add a text annotation to a drawing view (DrawingTexts.Add). "
+                    "By default (coords='view') x / y are VIEW units: model mm from "
+                    "the view's axis origin (xAxisData, yAxisData), i.e. sheet "
+                    "distance / view scale, NOT from the view's position. Pass "
+                    "coords='sheet' to give paper mm and let the tool convert "
+                    "(field-proven formula on R428 SP6). Use the sheet's Background "
+                    "view for title block text (there both frames coincide)."
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "text": {"type": "string", "description": "Text content"},
-                        "x": {"type": "number", "description": "X in mm (view coordinates)"},
-                        "y": {"type": "number", "description": "Y in mm (view coordinates)"},
+                        "x": {"type": "number", "description": "X in mm (frame per 'coords')"},
+                        "y": {"type": "number", "description": "Y in mm (frame per 'coords')"},
+                        "coords": _COORDS_PROPERTY,
                         "view_name": {
                             "type": "string",
                             "description": "Target view (default: last view; use 'Background View' for frames and title blocks)",
@@ -432,13 +581,16 @@ class DraftingTools:
                     "optionally fill its cells. Building block for title "
                     "blocks, revision tables and BOMs: pass 'cells' as rows "
                     "of strings, optional per-column widths, and the "
-                    "Background View as target for sheet-level tables."
+                    "Background View as target for sheet-level tables. x / y are "
+                    "view units (from the view's axis origin, divided by its scale) "
+                    "unless coords='sheet' (paper mm, converted by the tool)."
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "x": {"type": "number", "description": "Table X in mm (view coordinates)"},
-                        "y": {"type": "number", "description": "Table Y in mm (view coordinates)"},
+                        "x": {"type": "number", "description": "Table X in mm (frame per 'coords')"},
+                        "y": {"type": "number", "description": "Table Y in mm (frame per 'coords')"},
+                        "coords": _COORDS_PROPERTY,
                         "rows": {"type": "integer", "description": "Number of rows"},
                         "columns": {"type": "integer", "description": "Number of columns"},
                         "row_height": {"type": "number", "description": "Row height in mm (default 8)"},
@@ -523,7 +675,21 @@ class DraftingTools:
                         },
                         "angle": {
                             "type": "number",
-                            "description": "In-plane rotation of the view in degrees (default 0)",
+                            "description": (
+                                "In-plane rotation of the view in degrees (default 0). "
+                                "Plane zx shows the part's Z axis horizontal; angle=90 "
+                                "turns it upright (field-proven on R428 SP6)."
+                            ),
+                        },
+                        "up_axis": {
+                            "type": "string",
+                            "enum": ["x", "y", "z"],
+                            "description": (
+                                "Part axis that should point up on the sheet; mapped to "
+                                "'angle' (0 if it already is vertical in the plane, 90 "
+                                "if horizontal). E.g. plane='zx', up_axis='z'. Not with "
+                                "'face'."
+                            ),
                         },
                         "x": {
                             "type": "number",
@@ -587,6 +753,8 @@ class DraftingTools:
                 return self._link_attribute(arguments)
             case "catia_drawing_apply_template":
                 return self._apply_template(arguments)
+            case "catia_drawing_print":
+                return self._print(arguments)
             case _:
                 raise ValueError(f"Unknown drafting tool: {tool_name}")
 
@@ -813,6 +981,12 @@ class DraftingTools:
         if plane not in _PLANE_VECTORS:
             raise ValueError(f"Unknown plane '{plane}'. Use 'xy', 'yz', or 'zx'.")
         vx1, vy1, vz1, vx2, vy2, vz2 = _PLANE_VECTORS[plane]
+        if args.get("face") and args.get("up_axis"):
+            raise InvalidArgument("up_axis applies to 'plane' views; with 'face' pass 'angle'.")
+        if args.get("face"):
+            angle, orientation_notes = args.get("angle"), []
+        else:
+            angle, orientation_notes = _up_axis_angle(plane, args.get("up_axis"), args.get("angle"))
 
         # Resolve every input before touching the sheet, so a bad argument
         # never leaves an empty unconfigured view behind.
@@ -844,7 +1018,6 @@ class DraftingTools:
                     drawing.Activate()
                 except Exception:
                     pass
-        angle = args.get("angle")
 
         sheet = self._active_sheet(drawing)
         view = sheet.Views.Add(args.get("name") or "Front View")
@@ -873,16 +1046,25 @@ class DraftingTools:
         view.x = args.get("x", 300)
         view.y = args.get("y", 150)
         if angle:
-            import math as _math
-
-            view.Angle = _math.radians(angle)
+            view.Angle = math.radians(angle)
         gb.Update()
 
         self.conn.refresh_display()
-        return (
-            f"View '{view.Name}' of '{source}' added to sheet "
-            f"'{sheet.Name}' ({projection}) and updated."
-        )
+        return " ".join([
+            (f"View '{view.Name}' of '{source}' added to sheet "
+            f"'{sheet.Name}' ({projection}{self._angle_text(view, angle)}) and updated."),
+            *orientation_notes,
+        ])
+
+    @staticmethod
+    def _angle_text(view: Any, angle: float | None) -> str:
+        """', rotated N deg' read back from DrawingView.Angle (radians)."""
+        if not angle:
+            return ""
+        actual = _axis_number(view, "Angle")
+        if actual is None:
+            return f", rotation {angle:g} deg requested (Angle unreadable)"
+        return f", rotated {math.degrees(actual):g} deg"
 
     # CatDimType is 0-based in R20 (enum_CatDimType, 21 values, verified
     # live: catDimRadius = 5): Distance=0, DistanceOffset=1, Length=2,
@@ -1391,6 +1573,14 @@ class DraftingTools:
                 "Generated dimensions sit where CATIA puts them (often on model edges): "
                 "move them with catia_drawing_move_dimension."
             )
+        # Field report 2026-11-03 (R428 SP6), issues 1 and 8.
+        notes.append(
+            "Only 3D constraints become dimensions here; each lands in the view parallel to "
+            "its constraint. Edges of generated views are not addressable by automation "
+            "(R428 SP6): dimensions picked on model edges must be placed in the CATIA UI, "
+            "then formatted with catia_drawing_set_dimension_frame / "
+            "catia_drawing_set_dimension_text."
+        )
         result["notes"] = notes
         return json.dumps(result, indent=2, ensure_ascii=False)
 
@@ -1607,36 +1797,70 @@ class DraftingTools:
 
     @staticmethod
     def _strip_trailing_dash(view: Any, app: Any = None) -> str:
-        """Field report R428 SP6, 2026-11-02: CATIA named a section view
-        'Section A-A-'. Drop the trailing dash: DrawingView.Name first; if
-        CATIA keeps the old name, read GetViewName(prefix, ident, suffix)
-        (BSTR out-parameters, through SystemService.Evaluate) and rewrite
-        only the suffix with SetViewName. The ident is never touched: it is
-        the letter shared with the section callout in the parent view.
-        Unverified on R428 (which part carries the dash is an assumption);
-        the name is read back either way."""
+        """Field reports 2026-11-02 and 2026-11-03 (R428 SP6): CATIA names a
+        section view 'Section A-A-', and the earlier fallback did not remove
+        the dash live. Non-fatal, in order, reading the name back after each:
+
+        1. DrawingView.Name = name without the dash;
+        2. GetViewName(prefix, ident, suffix) (BSTR out-parameters through
+           SystemService.Evaluate), then SetViewName with the suffix's dash
+           dropped, or with an empty suffix;
+        3. view.Update() and a last read, in case CATIA recomposes the name.
+
+        The ident is never touched: it is the letter shared with the section
+        callout in the parent view. None of these steps is verified on R428;
+        the parts GetViewName returns are reported so a live run shows where
+        the dash lives."""
         name = str(safe_get(view, "Name", ""))
         if not name.endswith("-") or not name.rstrip("-").strip():
             return ""
         wanted = name.rstrip("-").rstrip()
+
+        def current() -> str:
+            return str(safe_get(view, "Name", ""))
+
+        tried = []
         try:
             view.Name = wanted
+            tried.append("Name")
         except Exception:
-            pass
-        if str(safe_get(view, "Name", "")) != wanted and app is not None:
+            tried.append("Name (refused)")
+        parts: tuple[str, str, str] | None = None
+        if current() != wanted and app is not None:
             try:
                 prefix, ident, suffix = (str(v or "") for v in call_out_values(app, view, "GetViewName", 3))
+                parts = (prefix, ident, suffix)
             except Exception:
-                prefix = ident = suffix = None
-            if suffix is not None and suffix.rstrip().endswith("-"):
-                try:
-                    view.SetViewName(prefix, ident, suffix.rstrip().rstrip("-").rstrip())
-                except Exception:
-                    pass
-        actual = str(safe_get(view, "Name", ""))
+                parts = None
+            if parts is not None:
+                prefix, ident, suffix = parts
+                stripped = suffix.rstrip().rstrip("-").rstrip()
+                for candidate in dict.fromkeys((stripped, "")):
+                    if candidate == suffix:
+                        continue
+                    try:
+                        view.SetViewName(prefix, ident, candidate)
+                        tried.append(f"SetViewName(suffix={candidate!r})")
+                    except Exception:
+                        tried.append(f"SetViewName(suffix={candidate!r}) (refused)")
+                    if current() == wanted:
+                        break
+        if current() == wanted:
+            try:
+                view.Update()
+            except Exception:
+                pass
+        actual = current()
         if actual == wanted:
             return f" (trailing '-' removed from CATIA's name '{name}')"
-        return f" (CATIA named it '{actual}' and kept the trailing '-'; rename it in the UI)"
+        detail = (
+            f" GetViewName reads prefix={parts[0]!r}, ident={parts[1]!r}, suffix={parts[2]!r}."
+            if parts is not None else " GetViewName could not be read."
+        )
+        return (
+            f" (CATIA named it '{actual}' and kept the trailing '-' after {', '.join(tried)};"
+            f"{detail} Rename it in the UI.)"
+        )
 
     def _detail_view(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
@@ -1795,6 +2019,7 @@ class DraftingTools:
         if plane not in _PLANE_VECTORS:
             raise ValueError(f"Unknown plane '{plane}'. Use 'xy', 'yz', or 'zx'.")
         vectors = [float(v) for v in _PLANE_VECTORS[plane]]
+        angle, orientation_notes = _up_axis_angle(plane, args.get("up_axis"), args.get("angle"))
         editor, source = self._find_source_3dx(args.get("part_name"))
         source_title = self.plm.title_of(source)
         drawing = self._find_active_drawing()
@@ -1831,18 +2056,19 @@ class DraftingTools:
                 {"iListofPrdInst": [root], "iPlane": vectors},
                 name, x, y,
             )
-        if args.get("angle"):
-            import math as _math
-
+        if angle:
+            # view.Angle = radians: angle=90 on a ZX view is field-proven on
+            # R428 SP6 (field report 2026-11-03); read back below.
             try:
-                view.Angle = _math.radians(args["angle"])
-            except Exception:
-                pass
+                view.Angle = math.radians(angle)
+            except Exception as e:
+                orientation_notes.append(f"Setting the view angle failed ({e}): rotate it in the UI.")
         self.conn.refresh_display()
-        return (
-            f"View '{safe_get(view, 'Name', name)}' of '{source_title}' added to sheet "
-            f"'{sheet.Name}' ({plane.upper()} projection, {route})."
-        )
+        return " ".join([
+            (f"View '{safe_get(view, 'Name', name)}' of '{source_title}' added to sheet "
+            f"'{sheet.Name}' ({plane.upper()} projection, {route}{self._angle_text(view, angle)})."),
+            *orientation_notes,
+        ])
 
     def _list_views(self) -> str:
         self.conn.ensure_connected()
@@ -1878,21 +2104,42 @@ class DraftingTools:
             sheets.append({"name": name, "active": name == active_name, "views": views})
         return json.dumps({"sheets": sheets}, indent=2, ensure_ascii=False)
 
+    @staticmethod
+    def _view_position(
+        view: Any, mode: str, x: float | None, y: float | None
+    ) -> tuple[float | None, float | None, str, list[str]]:
+        """(view x, view y, description, notes) for annotation placement."""
+        if mode == "view":
+            return x, y, "view coordinates", []
+        vx, vy, notes = _sheet_to_view(view, x, y)
+        given = ", ".join(f"{v:g}" for v in (x, y) if v is not None)
+        shown = ", ".join(f"{v:.3f}" for v in (vx, vy) if v is not None)
+        return vx, vy, f"view coordinates ({shown}) from sheet ({given}) mm", notes
+
     def _add_text(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
+        mode = _coords_mode(args)
+        x = self._number(args, "x", required=True)
+        y = self._number(args, "y", required=True)
         view = self._find_view_any(args.get("view_name"))
-        text = view.Texts.Add(str(args["text"]), float(args["x"]), float(args["y"]))
+        vx, vy, where, notes = self._view_position(view, mode, x, y)
+        text = view.Texts.Add(str(args["text"]), vx, vy)
         self.conn.refresh_display()
-        return f"Text '{text.Name}' added to view '{view.Name}' at ({args['x']}, {args['y']}) mm."
+        message = f"Text '{text.Name}' added to view '{view.Name}' at ({vx:g}, {vy:g}) mm ({where})."
+        return " ".join([message, *notes])
 
     def _add_table(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
+        mode = _coords_mode(args)
+        x = self._number(args, "x", required=True)
+        y = self._number(args, "y", required=True)
         view = self._find_view_any(args.get("view_name"))
         rows, cols = int(args["rows"]), int(args["columns"])
         if rows < 1 or cols < 1:
             raise ValueError("rows and columns must be at least 1")
+        vx, vy, where, coord_notes = self._view_position(view, mode, x, y)
         table = view.Tables.Add(
-            float(args["x"]), float(args["y"]), rows, cols,
+            vx, vy, rows, cols,
             float(args.get("row_height", 8.0)), float(args.get("column_width", 40.0)),
         )
         widths = args.get("column_widths") or []
@@ -1907,10 +2154,11 @@ class DraftingTools:
                 table.SetCellString(r, c, str(value))
                 filled += 1
         self.conn.refresh_display()
-        return (
-            f"Table '{table.Name}' ({rows}x{cols}) added to view '{view.Name}' "
-            f"at ({args['x']}, {args['y']}) mm, {filled} cell(s) filled."
-        )
+        return " ".join([
+            (f"Table '{table.Name}' ({rows}x{cols}) added to view '{view.Name}' "
+            f"at ({vx:g}, {vy:g}) mm ({where}), {filled} cell(s) filled."),
+            *coord_notes,
+        ])
 
     # ── Layout, title block and template tools ──
     #
@@ -2043,7 +2291,8 @@ class DraftingTools:
                 "description": (
                     "Write text into drawing table cells (DrawingTable.SetCellString, "
                     "field-proven on R428 SP6), e.g. title block or revision table "
-                    "fields. Give row/column/text for one cell or 'cells' for several."
+                    "fields. Give row/column/text for one cell or 'cells' for several. "
+                    "Cells are addressed by row/column; the table is not moved."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -2071,17 +2320,19 @@ class DraftingTools:
             {
                 "name": "catia_drawing_edit_text",
                 "description": (
-                    "Edit a drawing text: content (.Text), position (.x/.y, view "
-                    "coordinates in mm) and font size (SetFontSize(0, 0, size)), all "
-                    "field-proven on R428 SP6."
+                    "Edit a drawing text: content (.Text), position (.x/.y) and font "
+                    "size (SetFontSize(0, 0, size)), all field-proven on R428 SP6. "
+                    "Positions are view units (from the view's axis origin, divided "
+                    "by its scale) unless coords='sheet' (paper mm, converted)."
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         **text_target,
                         "text": {"type": "string", "description": "New content"},
-                        "x": {"type": "number", "description": "New X in mm"},
-                        "y": {"type": "number", "description": "New Y in mm"},
+                        "x": {"type": "number", "description": "New X in mm (frame per 'coords')"},
+                        "y": {"type": "number", "description": "New Y in mm (frame per 'coords')"},
+                        "coords": _COORDS_PROPERTY,
                         "font_size": {"type": "number", "description": "Font size in mm"},
                     },
                 },
@@ -2134,10 +2385,17 @@ class DraftingTools:
                     "editors, the route field-proven on R428 SP6 (3DEXPERIENCE has no "
                     "scriptable 'apply page layout'). Open the template first with "
                     "catia_open_from_database, and set the target sheet's size with "
-                    "catia_drawing_set_sheet. Tables whose names match "
+                    "catia_drawing_set_sheet. Background counts are read before and "
+                    "after from fresh collections and must equal before + copied per "
+                    "kind: surplus items (a doubled paste) are deleted and reported, "
+                    "missing ones reported. Tables whose names match "
                     "title_block_table / revision_table are anchored bottom-right "
-                    "(AnchorPoint 8) / top-right (AnchorPoint 6). The zone frame is "
-                    "NOT resized to another paper size."
+                    "(AnchorPoint 8) / top-right (AnchorPoint 6); matching tables kept "
+                    "in the template's MAIN view (some templates park them off-sheet) "
+                    "are copied too and always moved inside the border "
+                    "(border_offset, default 10 mm). A target that already holds the "
+                    "template's named tables is refused (ALREADY_APPLIED) unless "
+                    "allow_repeat. The zone frame is NOT resized to another paper size."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -2164,12 +2422,75 @@ class DraftingTools:
                         "border_offset": {
                             "type": "number",
                             "description": (
-                                "Distance in mm from the paper edge to the inner border; "
-                                "with it the anchored tables are moved into the corners"
+                                "Distance in mm from the paper edge to the inner border. "
+                                "With it, matched background tables are moved into the "
+                                "corners; main-view tables are always moved (default 10)."
+                            ),
+                        },
+                        "allow_repeat": {
+                            "type": "boolean",
+                            "description": (
+                                "Paste even when the target already holds the template's "
+                                "named tables (default false)"
                             ),
                         },
                     },
                     "required": ["template"],
+                },
+            },
+            {
+                "name": "catia_drawing_print",
+                "description": (
+                    "EXPERIMENTAL. Print drawing sheets to files, one file per sheet, "
+                    "with DrawingSheet.PrintToFile through the ACTIVE PRINTER: the only "
+                    "scripted PDF route on 3DEXPERIENCE R428 SP6 (field report "
+                    "2026-11-04; catia_export refuses PDF there). The output format is "
+                    "whatever that printer produces: with 'Microsoft Print to PDF' it is "
+                    "a PDF, but it may be IMAGE-ONLY (no text layer, so review tools "
+                    "cannot read the text) and LETTER-sized whatever the sheet size. "
+                    "Each file is checked on disk (size, PDF header, fonts, page size) "
+                    "and every such problem is reported as a warning. 'printer' picks "
+                    "another installed printer for this call (Application.Printers / "
+                    "ActivePrinter, unverified on R428) and restores the previous one."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": (
+                                "Absolute output folder (files are named <drawing>_<sheet>.pdf) "
+                                "or file path (several sheets add _<sheet> to the name)"
+                            ),
+                        },
+                        "sheets": {
+                            "anyOf": [
+                                {"type": "string", "enum": ["all"]},
+                                {"type": "array", "items": {"type": "string"}},
+                            ],
+                            "description": "'all' (default) or a list of sheet names",
+                        },
+                        "printer": {
+                            "type": "string",
+                            "description": (
+                                "Installed printer to use for this call (exact or unique "
+                                "partial name, e.g. 'Microsoft Print to PDF'); default the "
+                                "active printer"
+                            ),
+                        },
+                        "timeout": {
+                            "type": "number",
+                            "description": "Seconds to wait for each spooled file (default 60)",
+                        },
+                    },
+                    "required": ["file_path"],
+                },
+                "annotations": {
+                    "title": "Print drawing sheets to files",
+                    "readOnlyHint": False,
+                    "destructiveHint": False,
+                    "idempotentHint": False,
+                    "openWorldHint": False,
                 },
             },
         ]
@@ -2453,6 +2774,7 @@ class DraftingTools:
 
     def _edit_text(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
+        mode = _coords_mode(args)
         x, y = self._number(args, "x"), self._number(args, "y")
         size = self._number(args, "font_size")
         if size is not None and size <= 0:
@@ -2460,6 +2782,10 @@ class DraftingTools:
         if args.get("text") is None and x is None and y is None and size is None:
             raise InvalidArgument("Pass at least one of text, x, y, font_size.")
         view, text = self._find_text(args)
+        coord_notes: list[str] = []
+        where = ""
+        if x is not None or y is not None:
+            x, y, where, coord_notes = self._view_position(view, mode, x, y)
         steps = []
         if args.get("text") is not None:
             steps.append(("content", lambda: setattr(text, "Text", str(args["text"]))))
@@ -2476,11 +2802,13 @@ class DraftingTools:
             else:
                 step()
         self.conn.refresh_display()
-        return (
+        return " ".join([
             f"Text '{safe_get(text, 'Name', '<text>')}' of view '{view.Name}' updated "
             f"({', '.join(label for label, _ in steps)}): now '{safe_get(text, 'Text', '?')}' at "
-            f"({safe_get(text, 'x', '?')}, {safe_get(text, 'y', '?')})."
-        )
+            f"({safe_get(text, 'x', '?')}, {safe_get(text, 'y', '?')}) mm"
+            + (f" ({where})." if where else " (view coordinates)."),
+            *coord_notes,
+        ])
 
     def _part_reference_3dx(self, part_name: str | None) -> tuple[Any, str]:
         """The 3D Part's VPMReference: editor.GetService("PLMProductService")
@@ -2613,15 +2941,174 @@ class DraftingTools:
             raise AmbiguousTarget(f"'{title}' matches several open drawings: {titles}.")
         return matches[0]
 
-    @staticmethod
-    def _background_counts(view: Any) -> dict[str, int]:
+    # (key, collection) of the background items the template copy handles.
+    _TEMPLATE_KINDS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("tables", "Tables"), ("texts", "Texts"), ("geometry", "GeometricElements"),
+    )
+
+    @classmethod
+    def _background_counts(cls, view: Any) -> dict[str, int]:
         counts = {}
-        for key, collection in (("tables", "Tables"), ("texts", "Texts"), ("geometry", "GeometricElements")):
+        for key, collection in cls._TEMPLATE_KINDS:
             try:
                 counts[key] = int(getattr(view, collection).Count)
             except Exception:
                 counts[key] = 0
         return counts
+
+    @staticmethod
+    def _same_com(a: Any, b: Any) -> bool:
+        """COM identity: pywin32 compares dispatch wrappers by IUnknown, and
+        every read hands out a new wrapper, so `is` alone is not enough."""
+        if a is b:
+            return True
+        try:
+            return bool(a == b)
+        except Exception:
+            return False
+
+    @classmethod
+    def _dedupe(cls, items: list[Any]) -> tuple[list[Any], int]:
+        unique: list[Any] = []
+        for item in items:
+            if not any(cls._same_com(item, seen) for seen in unique):
+                unique.append(item)
+        return unique, len(items) - len(unique)
+
+    @staticmethod
+    def _paper_size_mm(sheet: Any) -> tuple[float, float, str] | None:
+        """(width, height, source) of the sheet's paper in mm: GetPaperWidth /
+        GetPaperHeight (V5 DrawingSheet methods, unverified on R428), else
+        the CatPaperSize value (field-proven A0-A3) and Orientation."""
+        try:
+            width, height = float(sheet.GetPaperWidth()), float(sheet.GetPaperHeight())
+            if width > 0 and height > 0:
+                return width, height, "GetPaperWidth/GetPaperHeight"
+        except Exception:
+            pass
+        try:
+            short, long_ = _PAPER_MM[int(sheet.PaperSize)]
+        except Exception:
+            return None
+        try:
+            landscape = int(sheet.Orientation) == 1
+        except Exception:
+            landscape = True
+        width, height = (long_, short) if landscape else (short, long_)
+        return width, height, "PaperSize/Orientation"
+
+    @staticmethod
+    def _copy_paste(source_sel: Any, target_sel: Any, items: list[tuple[str, Any]], into: Any) -> dict[str, int]:
+        """Field-proven on R428 SP6: template Selection.Add + Copy, then target
+        Selection.Add(background view) + Paste. Returns, per kind, how many
+        items were really selected (and so copied)."""
+        copied: dict[str, int] = {}
+        try:
+            source_sel.Clear()
+            for kind, element in items:
+                try:
+                    source_sel.Add(element)
+                except Exception:
+                    continue
+                copied[kind] = copied.get(kind, 0) + 1
+            if not copied:
+                return copied
+            source_sel.Copy()
+        finally:
+            try:
+                source_sel.Clear()
+            except Exception:
+                pass
+        try:
+            target_sel.Clear()
+            target_sel.Add(into)
+            target_sel.Paste()
+        finally:
+            try:
+                target_sel.Clear()
+            except Exception:
+                pass
+        return copied
+
+    def _reconcile_paste(
+        self,
+        sheet: Any,
+        selection: Any,
+        before: dict[str, int],
+        before_items: dict[str, list[Any]],
+        copied: dict[str, int],
+    ) -> dict[str, Any]:
+        """Compare the target background after a paste with before + copied,
+        per kind, from freshly fetched collections (sheet.Views each time).
+
+        Field report 2026-11-03 (R428 SP6): one apply_template call left the
+        background doubled (18 tables / 8 texts / 48 elements against 9 / 4 /
+        24 reported). CATIA appends pasted items at the end of a view's
+        collections, so the surplus is the newest items: they are deleted
+        (never an item that existed before the paste) and the counts read
+        again. Whether a paste can double on R428 is not reproduced offline;
+        the check holds whatever the cause."""
+        after = self._background_counts(sheet.Views.Item(2))
+        surplus_removed: dict[str, int] = {}
+        missing: dict[str, int] = {}
+        notes: list[str] = []
+        doomed: list[Any] = []
+        for key, collection in self._TEMPLATE_KINDS:
+            expected = before.get(key, 0) + copied.get(key, 0)
+            extra = after.get(key, 0) - expected
+            if extra < 0 and copied.get(key):
+                missing[key] = -extra
+            if extra <= 0:
+                continue
+            coll = getattr(sheet.Views.Item(2), collection)
+            candidates = [coll.Item(i) for i in range(expected + 1, after[key] + 1)]
+            keep = [c for c in candidates if any(self._same_com(c, old) for old in before_items.get(key, []))]
+            if keep:
+                notes.append(
+                    f"{len(keep)} surplus {key} item(s) existed before the paste and were kept; "
+                    "check the background with catia_drawing_list_views / catia_screenshot."
+                )
+            removable = [c for c in candidates if not any(self._same_com(c, k) for k in keep)]
+            if removable:
+                surplus_removed[key] = len(removable)
+                doomed.extend(removable)
+        delete_error = None
+        if doomed:
+            try:
+                selection.Clear()
+                for obj in doomed:
+                    selection.Add(obj)
+                selection.Delete()
+            except Exception as e:
+                delete_error = str(e)
+            finally:
+                try:
+                    selection.Clear()
+                except Exception:
+                    pass
+            after = self._background_counts(sheet.Views.Item(2))
+        if surplus_removed:
+            notes.append(
+                "CATIA pasted more than was copied ("
+                + ", ".join(f"{k}: +{n}" for k, n in surplus_removed.items())
+                + "): "
+                + (f"deleting the duplicates FAILED ({delete_error}); remove them by hand."
+                   if delete_error else "the duplicate (newest) items were deleted.")
+            )
+        if missing:
+            notes.append(
+                "Fewer items arrived than were copied ("
+                + ", ".join(f"{k}: {n} missing" for k, n in missing.items())
+                + "); check the background."
+            )
+        return {
+            "after": after,
+            "added": {k: after[k] - before.get(k, 0) for k in after},
+            "surplus_removed": surplus_removed,
+            "missing": missing,
+            "delete_error": delete_error,
+            "notes": notes,
+        }
 
     def _apply_template(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()
@@ -2635,6 +3122,8 @@ class DraftingTools:
                 except re.error as e:
                     raise InvalidArgument(f"'{key}' is not a valid regular expression: {e}.") from None
         offset = self._number(args, "border_offset")
+        if offset is not None and offset < 0:
+            raise InvalidArgument("'border_offset' must not be negative.")
 
         entries = self._drawing_entries()
         template = self._match_entry(entries, str(args["template"]), "template")
@@ -2659,63 +3148,106 @@ class DraftingTools:
         if target is template:
             raise InvalidArgument("The template and the target are the same drawing.")
 
-        source_bg = self._active_sheet(template["drawing"]).Views.Item(2)
+        template_sheet = self._active_sheet(template["drawing"])
+        source_views = template_sheet.Views
+        source_bg = source_views.Item(2)
         target_sheet = self._active_sheet(target["drawing"])
-        target_bg = target_sheet.Views.Item(2)
-        kinds = [
-            ("tables", "Tables", args.get("include_tables", True)),
-            ("texts", "Texts", args.get("include_texts", True)),
-            ("geometry", "GeometricElements", args.get("include_geometry", True)),
-        ]
-        elements: list[Any] = []
+        wanted = {
+            "tables": args.get("include_tables", True),
+            "texts": args.get("include_texts", True),
+            "geometry": args.get("include_geometry", True),
+        }
+        items: list[tuple[str, Any]] = []
         selected: dict[str, int] = {}
-        for key, collection, wanted in kinds:
-            if not wanted:
+        duplicates = 0
+        for key, collection in self._TEMPLATE_KINDS:
+            if not wanted[key]:
                 continue
             try:
-                items = list(iter_items(getattr(source_bg, collection)))
+                found = list(iter_items(getattr(source_bg, collection)))
             except Exception:
-                items = []
-            selected[key] = len(items)
-            elements.extend(items)
-        if not elements:
+                found = []
+            found, dropped = self._dedupe(found)
+            duplicates += dropped
+            selected[key] = len(found)
+            items.extend((key, item) for item in found)
+
+        # Title block / revision table kept in the template's MAIN view (field
+        # report 2026-11-03: the site template keeps them there, off-sheet at
+        # negative y): copied in a second paste into the target background
+        # and anchored inside the border.
+        main_tables: list[tuple[str, Any]] = []
+        if patterns and wanted["tables"]:
+            try:
+                main_found = list(iter_items(source_views.Item(1).Tables))
+            except Exception:
+                main_found = []
+            for table in self._dedupe(main_found)[0]:
+                name = str(safe_get(table, "Name", ""))
+                role = next((r for r, p in patterns.items() if p.search(name)), None)
+                if role is not None:
+                    main_tables.append((role, table))
+        if not items and not main_tables:
             raise ObjectNotFound(
                 f"The template '{template['title']}' Background view holds nothing to copy "
                 f"({', '.join(f'{k}: 0' for k in selected) or 'every kind excluded'})."
             )
 
-        # Field-proven on R428 SP6: template Selection.Add + Copy, then target
-        # Selection.Add(background view) + Paste.
-        source_sel, target_sel = template["selection"], target["selection"]
-        add_failures = 0
-        try:
-            source_sel.Clear()
-            for element in elements:
-                try:
-                    source_sel.Add(element)
-                except Exception:
-                    add_failures += 1
-            source_sel.Copy()
-        finally:
-            try:
-                source_sel.Clear()
-            except Exception:
-                pass
+        # A repeated call (a retry after a timeout, say) pastes a second copy.
+        # Field report 2026-11-03 reported +9 / +4 / +24 for a background that
+        # then held 18 / 8 / 48: after - before = 9 means the background
+        # already held one copy BEFORE that call, i.e. the template had been
+        # applied before. Refuse when the target already holds the template:
+        # every distinctive table name, or every template text string with at
+        # least the template's item counts.
+        target_bg = target_sheet.Views.Item(2)
         before = self._background_counts(target_bg)
         try:
-            target_sel.Clear()
-            target_sel.Add(target_bg)
-            target_sel.Paste()
-        finally:
+            existing_tables = {str(safe_get(t, "Name", "")) for t in iter_items(target_bg.Tables)}
+        except Exception:
+            existing_tables = set()
+        # CATIA's default names ('Table.3') prove nothing: only distinctive
+        # names count.
+        template_tables = {
+            name for name in (
+                str(safe_get(t, "Name", ""))
+                for t in [*(t for k, t in items if k == "tables"), *(t for _, t in main_tables)]
+            )
+            if name and not re.fullmatch(r"Table\.\d+", name)
+        }
+        template_texts = {
+            s for s in (str(safe_get(t, "Text", "") or "").strip() for k, t in items if k == "texts") if s
+        }
+        evidence = ""
+        if template_tables and template_tables <= existing_tables:
+            evidence = f"table(s) {', '.join(sorted(template_tables))}"
+        elif template_texts and all(before.get(k, 0) >= n for k, n in selected.items()):
             try:
-                target_sel.Clear()
+                existing_texts = {
+                    str(safe_get(t, "Text", "") or "").strip() for t in iter_items(target_bg.Texts)
+                }
             except Exception:
-                pass
+                existing_texts = set()
+            if template_texts <= existing_texts:
+                evidence = f"all {len(template_texts)} template text(s) and at least as many items"
+        if evidence and not args.get("allow_repeat"):
+            raise CATIAToolError(
+                f"The target's background already holds the template's {evidence}: the "
+                "template looks applied already. Nothing was pasted. Pass allow_repeat=true "
+                "to paste another copy.",
+                code="ALREADY_APPLIED",
+            )
+
+        before_items = {
+            key: list(iter_items(getattr(target_bg, collection)))
+            for key, collection in self._TEMPLATE_KINDS
+        }
+        source_sel, target_sel = template["selection"], target["selection"]
+        copied = self._copy_paste(source_sel, target_sel, items, target_sheet.Views.Item(2)) if items else {}
 
         with after_mutation():
-            after = self._background_counts(target_bg)
-            added = {k: after[k] - before[k] for k in after}
-            if not any(v > 0 for v in added.values()):
+            first = self._reconcile_paste(target_sheet, target_sel, before, before_items, copied)
+            if items and not any(v > 0 for v in first["added"].values()):
                 raise CATIAToolError(
                     "Paste added nothing to the target's Background view (CATIA accepted the "
                     "copy and paste without effect). Activate the target drawing and retry, "
@@ -2723,62 +3255,349 @@ class DraftingTools:
                     code="FEATURE_NO_EFFECT",
                     modified=False,
                 )
-            anchored = self._anchor_template_tables(target_sheet, target_bg, before["tables"], patterns, offset)
+            tables_after_first = first["after"]["tables"]
+            anchored = self._anchor_template_tables(
+                target_sheet, target_sheet.Views.Item(2), before["tables"], patterns, offset,
+                last=tables_after_first,
+            )
+            second = None
+            if main_tables:
+                fresh_bg = target_sheet.Views.Item(2)
+                mid_items = {
+                    key: list(iter_items(getattr(fresh_bg, collection)))
+                    for key, collection in self._TEMPLATE_KINDS
+                }
+                main_copied = self._copy_paste(
+                    source_sel, target_sel, [("tables", t) for _, t in main_tables], fresh_bg,
+                )
+                second = self._reconcile_paste(
+                    target_sheet, target_sel, first["after"], mid_items, main_copied,
+                )
+                # Main-view tables sit off-sheet in the template: always move
+                # them inside the border (default 10 mm from the paper edge).
+                anchored += self._anchor_template_tables(
+                    target_sheet, target_sheet.Views.Item(2), tables_after_first, patterns,
+                    offset if offset is not None else 10.0,
+                    roles=[r for r, _ in main_tables], source="main view",
+                )
         self.conn.refresh_display()
+        final = (second or first)["after"]
+        added = {k: final[k] - before[k] for k in final}
         notes = [
             (
                 "The zone frame was NOT resized: if the template was drawn for another paper "
                 "size, rework its frame (DrawingTable.RemoveColumn/RemoveRow/SetColumnSize/"
                 "SetRowSize) or pick a template of the target size."
             ),
+            *first["notes"],
+            *((second or {}).get("notes") or []),
         ]
-        if add_failures:
-            notes.append(f"{add_failures} template element(s) could not be selected and were not copied.")
+        if duplicates:
+            notes.append(f"{duplicates} duplicate template element(s) were listed twice and copied once.")
+        not_selected = sum(selected.values()) - sum(copied.values())
+        if items and not_selected > 0:
+            notes.append(f"{not_selected} template element(s) could not be selected and were not copied.")
         for key, pattern in patterns.items():
             if not any(a["role"] == key for a in anchored):
                 notes.append(f"No pasted table matched {key} /{pattern.pattern}/.")
-        return json.dumps({
+        result: dict[str, Any] = {
             "template": template["title"],
             "target": target["title"],
             "selected": selected,
+            "copied": copied,
             "added_to_background": added,
+            "background_counts": {"before": before, "after": final},
             "anchored_tables": anchored,
             "notes": notes,
-        }, indent=2, ensure_ascii=False)
+        }
+        if main_tables:
+            result["main_view_tables"] = [
+                {"table": str(safe_get(t, "Name", "")), "role": r} for r, t in main_tables
+            ]
+        surplus = {**first["surplus_removed"]}
+        if second:
+            for k, n in second["surplus_removed"].items():
+                surplus[k] = surplus.get(k, 0) + n
+        if surplus:
+            result["duplicates_removed"] = surplus
+        return json.dumps(result, indent=2, ensure_ascii=False)
 
     def _anchor_template_tables(
-        self, sheet: Any, view: Any, first_new: int, patterns: dict[str, Any], offset: float | None
+        self,
+        sheet: Any,
+        view: Any,
+        first_new: int,
+        patterns: dict[str, Any],
+        offset: float | None,
+        *,
+        last: int | None = None,
+        roles: list[str] | None = None,
+        source: str = "background",
     ) -> list[dict[str, Any]]:
-        """Anchor pasted tables matched by name: title block bottom-right
-        (AnchorPoint 8), revision table top-right (AnchorPoint 6), field-proven
-        on R428 SP6. Name matching and moving them into the corners at
-        border_offset from the paper edge (GetPaperWidth / GetPaperHeight)
-        are unverified."""
+        """Anchor pasted tables (view.Tables items first_new+1 .. last): title
+        block bottom-right (AnchorPoint 8), revision table top-right
+        (AnchorPoint 6), field-proven on R428 SP6. A table's role comes from
+        its name; when CATIA renamed it on paste, from `roles` (the copied
+        tables' roles, in paste order). Moving them into the corners at
+        `offset` mm from the paper edge (paper size from the sheet) is
+        unverified; the position is read back."""
         if not patterns:
             return []
-        width = height = None
-        if offset is not None:
-            try:
-                width, height = float(sheet.GetPaperWidth()), float(sheet.GetPaperHeight())
-            except Exception:
-                width = height = None
+        paper = self._paper_size_mm(sheet) if offset is not None else None
         anchored = []
         tables = view.Tables
-        for i in range(first_new + 1, int(tables.Count) + 1):
+        end = int(tables.Count) if last is None else min(last, int(tables.Count))
+        for n, i in enumerate(range(first_new + 1, end + 1)):
             table = tables.Item(i)
             name = str(safe_get(table, "Name", ""))
-            for role, anchor, corner_y in (("title_block_table", 8, "bottom"), ("revision_table", 6, "top")):
-                pattern = patterns.get(role)
-                if pattern is None or not pattern.search(name):
-                    continue
-                table.AnchorPoint = anchor
-                row: dict[str, Any] = {"table": name, "role": role, "anchor_point": anchor}
-                if width is not None and height is not None and offset is not None:
-                    table.x = width - offset
-                    table.y = offset if corner_y == "bottom" else height - offset
-                    row["position"] = [table.x, table.y]
-                elif offset is not None:
-                    row["position"] = "not moved: paper size unreadable"
-                anchored.append(row)
-                break
+            role = next((r for r, p in patterns.items() if p.search(name)), None)
+            if role is None and roles is not None and n < len(roles):
+                role = roles[n]
+            if role is None:
+                continue
+            anchor, corner_y = (8, "bottom") if role == "title_block_table" else (6, "top")
+            table.AnchorPoint = anchor
+            row: dict[str, Any] = {"table": name, "role": role, "anchor_point": anchor, "from": source}
+            if paper is not None and offset is not None:
+                width, height, _ = paper
+                table.x = width - offset
+                table.y = offset if corner_y == "bottom" else height - offset
+                row["position"] = [safe_get(table, "x"), safe_get(table, "y")]
+                row["paper_mm"] = [width, height]
+            elif offset is not None:
+                row["position"] = "not moved: paper size unreadable"
+            anchored.append(row)
         return anchored
+
+    # ── printing (experimental) ──
+
+    # Seconds between checks for a spooled file; tests set it to 0.
+    _PRINT_POLL: ClassVar[float] = 0.25
+
+    _PDF_WARNING = (
+        "PrintToFile writes whatever the active printer produces. With 'Microsoft Print "
+        "to PDF' the result can be image-only (no text layer, so review tools read it "
+        "from images alone) and Letter-sized whatever the sheet size (field report "
+        "2026-11-04). For a vector PDF at the sheet size, export from the CATIA UI or "
+        "use a PDF printer set to the sheet's paper size."
+    )
+
+    @staticmethod
+    def _file_name_part(value: str) -> str:
+        return re.sub(r'[<>:"/\\|?*\s]+', "_", value).strip("._") or "sheet"
+
+    def _select_printer(self, wanted: str) -> tuple[Any, str]:
+        """Make `wanted` the active printer: Application.Printers and
+        Application.ActivePrinter, V5 Application members, unverified on
+        3DEXPERIENCE R428. Returns (previous printer, chosen name); refuses
+        before anything is printed when the API is missing."""
+        app = self.conn.app
+        try:
+            printers = list(iter_items(app.Printers))
+        except Exception as e:
+            raise UnsupportedCapability(
+                f"This CATIA exposes no printer list (Application.Printers: {e}). Leave "
+                "'printer' out to use the active printer, or change it in the CATIA UI."
+            ) from None
+        names = [str(safe_get(p, "DeviceName", safe_get(p, "Name", "")) or "") for p in printers]
+        matches = [p for p, n in zip(printers, names) if n.lower() == wanted.lower()] or [
+            p for p, n in zip(printers, names) if wanted.lower() in n.lower()
+        ]
+        if len(matches) != 1:
+            listing = ", ".join(n for n in names if n) or "none"
+            if not matches:
+                raise ObjectNotFound(f"No printer named '{wanted}'. Printers: {listing}.")
+            raise AmbiguousTarget(f"'{wanted}' matches several printers: {listing}.")
+        chosen = matches[0]
+        chosen_name = names[printers.index(chosen)]
+        previous = safe_get(app, "ActivePrinter")
+        try:
+            app.ActivePrinter = chosen
+        except Exception as e:
+            raise UnsupportedCapability(
+                f"Setting Application.ActivePrinter to '{chosen_name}' failed ({e}). Select "
+                "the printer in the CATIA UI and call again without 'printer'."
+            ) from None
+        now = str(safe_get(safe_get(app, "ActivePrinter"), "DeviceName", "") or "")
+        if now and now != chosen_name:
+            try:
+                app.ActivePrinter = previous
+            except Exception:
+                pass
+            raise UnsupportedCapability(
+                f"Application.ActivePrinter reads '{now}' after selecting '{chosen_name}'. "
+                "Select the printer in the CATIA UI."
+            )
+        return previous, chosen_name
+
+    def _wait_for_file(self, path: str, before: float | None, timeout: float) -> bool:
+        """True once `path` exists, is newer than `before` and its size held
+        still for one poll (spoolers write the file after PrintToFile returns)."""
+        deadline = time.monotonic() + timeout
+        last_size = -1
+        while True:
+            if os.path.isfile(path):
+                mtime = os.path.getmtime(path)
+                size = os.path.getsize(path)
+                if (before is None or mtime > before) and size > 0 and size == last_size:
+                    return True
+                last_size = size
+            if time.monotonic() >= deadline:
+                return os.path.isfile(path) and os.path.getsize(path) > 0 and (
+                    before is None or os.path.getmtime(path) > before
+                )
+            time.sleep(self._PRINT_POLL)
+
+    @staticmethod
+    def _inspect_print(path: str, paper: tuple[float, float, str] | None) -> tuple[dict[str, Any], list[str]]:
+        """Size, PDF header, text layer (fonts) and page size of a printed file."""
+        size = os.path.getsize(path)
+        info: dict[str, Any] = {"file": path, "bytes": size}
+        warnings: list[str] = []
+        with open(path, "rb") as handle:
+            data = handle.read(64 * 1024 * 1024)
+        info["pdf"] = data.startswith(b"%PDF")
+        if not info["pdf"]:
+            warnings.append(
+                f"{os.path.basename(path)} is not a PDF: the active printer does not print to PDF."
+            )
+            return info, warnings
+        if b"/Font" in data:
+            info["text_layer"] = True
+        elif b"/ObjStm" in data:
+            info["text_layer"] = None  # compressed object streams: cannot tell
+        else:
+            info["text_layer"] = False
+            warnings.append(
+                f"{os.path.basename(path)} has no fonts: it is image-only (no text layer)."
+            )
+        box = re.search(
+            rb"/MediaBox\s*\[\s*(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s*\]", data
+        )
+        if box:
+            x1, y1, x2, y2 = (float(v) for v in box.groups())
+            page = (round(abs(x2 - x1) * 25.4 / 72, 1), round(abs(y2 - y1) * 25.4 / 72, 1))
+            info["page_mm"] = list(page)
+            letter = sorted(page) == sorted((215.9, 279.4)) or all(
+                abs(a - b) < 1.0 for a, b in zip(sorted(page), (215.9, 279.4))
+            )
+            if paper is not None:
+                sheet_mm = sorted(paper[:2])
+                if any(abs(a - b) > 2.0 for a, b in zip(sorted(page), sheet_mm)):
+                    warnings.append(
+                        f"{os.path.basename(path)} page is {page[0]:g} x {page[1]:g} mm"
+                        + (" (Letter)" if letter else "")
+                        + f" but the sheet is {paper[0]:g} x {paper[1]:g} mm: the printer "
+                        "scaled the drawing."
+                    )
+        return info, warnings
+
+    def _print(self, args: dict[str, Any]) -> str:
+        self.conn.ensure_connected()
+        raw = str(args.get("file_path") or "").strip()
+        if not raw:
+            raise InvalidArgument("'file_path' (absolute output folder or file) is required.")
+        path = os.path.expanduser(raw)
+        if not os.path.isabs(path):
+            raise InvalidArgument(f"'file_path' must be absolute, got {raw!r}.")
+        timeout = self._number(args, "timeout")
+        timeout = 60.0 if timeout is None else max(0.0, min(timeout, 600.0))
+        drawing = self._find_active_drawing()
+        sheets = self._sheets(drawing)
+        wanted = args.get("sheets") or "all"
+        if isinstance(wanted, str):
+            if wanted.strip().lower() != "all":
+                wanted = [wanted]
+            else:
+                wanted = None
+        if wanted is not None:
+            by_name = {str(safe_get(s, "Name", "")): s for s in sheets}
+            unknown = [str(n) for n in wanted if str(n) not in by_name]
+            if unknown:
+                raise ObjectNotFound(
+                    f"No sheet named {', '.join(repr(n) for n in unknown)}. Sheets: "
+                    f"{', '.join(by_name) or 'none'}."
+                )
+            sheets = [by_name[str(n)] for n in dict.fromkeys(str(n) for n in wanted)]
+
+        title = self.plm.title_of(drawing) if self.conn.is_3dx else str(safe_get(drawing, "Name", "drawing"))
+        title = os.path.splitext(str(title or "drawing"))[0]
+        root, ext = os.path.splitext(path)
+        as_folder = os.path.isdir(path) or raw.endswith(("/", "\\")) or not ext
+        names = [str(safe_get(s, "Name", f"Sheet.{i}")) for i, s in enumerate(sheets, start=1)]
+        if as_folder:
+            folder = path
+            outputs = [
+                os.path.join(folder, f"{self._file_name_part(title)}_{self._file_name_part(n)}.pdf")
+                for n in names
+            ]
+        else:
+            folder = os.path.dirname(path)
+            outputs = [path] if len(sheets) == 1 else [
+                f"{root}_{self._file_name_part(n)}{ext}" for n in names
+            ]
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as e:
+            raise InvalidArgument(f"Cannot create the output folder '{folder}': {e}.") from None
+
+        app = self.conn.app
+        previous_printer = None
+        if args.get("printer"):
+            previous_printer, printer_name = self._select_printer(str(args["printer"]))
+        else:
+            printer_name = str(safe_get(safe_get(app, "ActivePrinter"), "DeviceName", "") or "") or None
+        try:
+            original_sheet = self._active_sheet(drawing)
+        except Exception:
+            original_sheet = None
+
+        files: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        try:
+            for sheet, name, out in zip(sheets, names, outputs):
+                before = os.path.getmtime(out) if os.path.exists(out) else None
+                try:
+                    sheet.Activate()  # unverified whether PrintToFile needs it
+                except Exception:
+                    pass
+                try:
+                    sheet.PrintToFile(out)
+                except Exception as e:
+                    files.append({"sheet": name, "file": out, "error": f"PrintToFile failed: {e}"})
+                    continue
+                if not self._wait_for_file(out, before, timeout):
+                    files.append({
+                        "sheet": name, "file": out,
+                        "error": f"no new file on disk after {timeout:g} s (printer queue or dialog?)",
+                    })
+                    continue
+                info, problems = self._inspect_print(out, self._paper_size_mm(sheet))
+                files.append({"sheet": name, **info})
+                warnings.extend(problems)
+        finally:
+            if original_sheet is not None:
+                try:
+                    original_sheet.Activate()
+                except Exception:
+                    pass
+            if args.get("printer"):
+                try:
+                    app.ActivePrinter = previous_printer
+                except Exception:
+                    warnings.append("The previous active printer could not be restored.")
+        written = [f for f in files if "error" not in f]
+        if not written:
+            raise CATIAToolError(
+                "No sheet was printed to a file: "
+                + "; ".join(f"{f['sheet']}: {f['error']}" for f in files)
+                + ". Print from the CATIA UI.",
+                code="FEATURE_NO_EFFECT",
+            )
+        return json.dumps({
+            "experimental": True,
+            "drawing": title,
+            "printer": printer_name,
+            "files": files,
+            "warnings": [*dict.fromkeys(warnings), self._PDF_WARNING],
+        }, indent=2, ensure_ascii=False)

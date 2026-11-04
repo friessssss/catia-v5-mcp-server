@@ -139,6 +139,35 @@ Send back `probe_3dx.json` from the Desktop.
    drawing.` Expected: refused with WRITE_PROTECTED (owned by another user).
 8. `Preview saving probe part 2.` Expected: a description, nothing saved.
 
+## Round 3 checks (after the 2026-11-03/04 drawing sessions)
+
+`catia-mcp update`, then confirm the commit with `catia-mcp status`. Use a
+drawing of your own that is In Work (and a Released one for step 2).
+
+1. `Read this drawing with catia_drawing_read and list the title block
+   fields, notes and basic dimensions.` Compare with the sheet: every field
+   value right (both template layouts), notes in order.
+2. Activate a Released drawing: `Run a read-only check of its notes with
+   catia_run_python.` Expected: allowed, `modified: false`. Then `Change a
+   note on it.` Expected: refused (WRITE_PROTECTED).
+3. `Make dimension 1 in <view> basic with 3 decimals.` Expected: rectangle
+   frame (not a circle), 3 decimals.
+4. `Add a diamond flag 5 next to note 5` and `add datum D` at given sheet
+   positions. Expected: they land where asked, in the right view.
+5. `Add a position FCF Ø1 | B | C below the hole callout, styled like the
+   existing frame.`
+6. `Apply <your company drawing template>` to a fresh drawing. Expected:
+   counts match the template, no duplicates, title block and revision table
+   anchored in the corners. Applying again is refused.
+7. `Print the drawing to PDF in Downloads.` Note the paper size and whether
+   the PDF has selectable text.
+8. On a part with two bodies: `Inertia of all bodies` and `scale Body.2 by
+   1.001 in Z` (check the bounding box changes only in Z).
+9. Rename a part, then `activate it by its PLM id` and run a write with that
+   id as target_id. Expected: works despite the stale window caption.
+10. Zoom the drawing by script, then screenshot with fit=false twice after
+    changing something. Expected: the second image differs.
+
 ## Updating to a newer version
 
 Once version 0.3.0 or later is installed, updating is one command:

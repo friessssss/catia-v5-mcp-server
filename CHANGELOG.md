@@ -79,6 +79,26 @@ All notable changes to this project are documented here.
 - `catia-mcp update` (and `--check`): reinstall the newest commit of the
   installed branch; the installer closes and reopens Claude Desktop.
 
+- **Field reports 2026-11-03/04 (drawing sessions on R428 SP6).**
+  - `catia_drawing_read`: one read-only call returns a drawing's structure:
+    sheets, views (scale, axis origin), notes in order, tables with cells,
+    title block for both template layouts (value below or beside the
+    label), revision table, BOM, dimensions with value, type, frame,
+    precision and texts, balloons, flags, datum features and FCF tables.
+  - Annotations in sheet millimetres (axis-origin conversion built in):
+    `catia_drawing_set_dimension_frame` (basic = rectangle 5, not circle 1;
+    precision), `catia_drawing_add_flag` (diamond 5 / circle 3),
+    `catia_drawing_add_datum`, `catia_drawing_add_fcf`; text tools accept
+    `coords: "sheet"`.
+  - `catia_drawing_print`: per-sheet print to file (the only 3DX route;
+    warns that Microsoft Print to PDF can be image-only / Letter).
+  - `catia_scale_body` (Affinity with the AxisOrigin raw PROPERTYPUT);
+    `catia_get_inertia` / `catia_get_bounding_box` take `body_name` or "all".
+  - `catia_activate_document` and `target_id` accept the PLM id (titles and
+    captions change on rename; captions' ` A:1` suffixes are tolerated).
+  - `catia_run_python` reports `modified: false` for scripts with no
+    assignment or modifying call, and such read-only scripts may read
+    Released or other users' drawings (pre-checks).
 ### Changed
 - The server attaches only to a running CATIA; tools fail with
   `CATIA_NOT_RUNNING` until it is started, and reattach by themselves after
@@ -112,6 +132,16 @@ All notable changes to this project are documented here.
   refusals persist on disk for 30 days (`plm_refusals.json` in the state
   folder), so the dialog appears at most once per machine. A refused
   Physical Product is not retried either.
+- `catia_drawing_apply_template` pasted the background twice while
+  reporting one copy: the copy list is deduplicated, counts re-read and
+  verified, surplus removed; title block / revision tables kept in the
+  template's main view are copied and anchored; repeats need
+  `allow_repeat`.
+- Screenshots after a scripted zoom could be stale: the viewer is refreshed
+  and an identical capture is retaken; 2D `origin` / `zoom` options.
+- Volume of a pasted (non-main) body on 3DEXPERIENCE; ZX/YZ front views
+  get an orientation hint; generate_dimensions says plainly that edge-picked
+  dimensions must be placed in the UI.
 - 3DEXPERIENCE fillets: `AddNewSolidEdgeFilletWithConstantRadius` failed
   on every edge reference; edges now come from the field-proven
   `Topology.CGMEdge` search, shared by `catia_list_edges` (12 edges on a box,

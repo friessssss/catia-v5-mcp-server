@@ -29,6 +29,8 @@ from catia_mcp.tools.assembly import AssemblyTools
 from catia_mcp.tools.diagnostics import DiagnosticsTools
 from catia_mcp.tools.document import DocumentTools
 from catia_mcp.tools.drawing import DraftingTools
+from catia_mcp.tools.drawing_annotate import DrawingAnnotateTools
+from catia_mcp.tools.drawing_read import DrawingReadTools
 from catia_mcp.tools.export import ExportTools
 from catia_mcp.tools.gsd import GSDTools
 from catia_mcp.tools.introspection import IntrospectionTools
@@ -103,6 +105,14 @@ catia_status.write_target and pass its id as target_id: the call is then
 refused (TARGET_MISMATCH) if another window is in front. Never save
 (catia_save_document publishes to the shared space) unless the user asked.
 
+Drawings: read one whole with catia_drawing_read (views with axis origins,
+notes, tables, title block, dimensions with frames) before editing. Place
+annotations with the drawing tools in SHEET millimetres (they convert to the
+view's axis-origin coordinates); basic dimensions via
+catia_drawing_set_dimension_frame(frame="basic"). Generated view edges cannot
+be dimensioned by automation: ask the user to place those dimensions in the
+UI, then format them.
+
 When no dedicated tool fits, use catia_run_python: it runs Python in the
 server with the live COM objects (catia, part, editor, ...) and returns
 printed output and a `result` value. Look members up first with
@@ -150,6 +160,7 @@ CORE_TOOLS = frozenset(
         "catia_undo",
         "catia_redo",
         "catia_get_selection",
+        "catia_drawing_read",
         "catia_list_documents",
         "catia_open_document",
         "catia_save_document",
@@ -176,6 +187,17 @@ _DESTRUCTIVE = re.compile(
     r"^catia_(close_document|delete_.*|run_python|run_script|set_plm_attributes|"
     r"save_document|disconnect|.*_delete_.*)$"
 )
+
+
+def _script_reads_only(code: str) -> bool:
+    import ast
+
+    from catia_mcp.tools.introspection import _looks_read_only
+
+    try:
+        return _looks_read_only(ast.parse(code))
+    except SyntaxError:
+        return False
 
 
 def is_guarded(definition: dict[str, Any]) -> bool:
@@ -272,6 +294,8 @@ class CATIAMCPServer:
         self.gsd_tools = GSDTools(self.connection)
         self.diagnostics_tools = DiagnosticsTools(self.connection)
         self.drafting_tools = DraftingTools(self.connection)
+        self.drawing_read_tools = DrawingReadTools(self.connection)
+        self.drawing_annotate_tools = DrawingAnnotateTools(self.connection)
         self.knowledge_tools = KnowledgeTools(self.connection)
         self.assembly_tools = AssemblyTools(self.connection)
         self.measurement_tools = MeasurementTools(self.connection)
@@ -287,6 +311,8 @@ class CATIAMCPServer:
             self.gsd_tools,
             self.diagnostics_tools,
             self.drafting_tools,
+            self.drawing_read_tools,
+            self.drawing_annotate_tools,
             self.knowledge_tools,
             self.assembly_tools,
             self.measurement_tools,
@@ -519,6 +545,10 @@ class CATIAMCPServer:
             return False  # a preview writes nothing: let it describe protected content
         if name == "catia_close_document":
             return bool(arguments.get("save"))  # close-with-save publishes
+        if name == "catia_run_python" and _script_reads_only(arguments.get("code", "")):
+            # Reading a Released or someone else's drawing (pre-checks) is
+            # safe; any assignment or modifying call keeps the guard on.
+            return False
         if name == "catia_drawing_list_dimensions":
             # refresh (default) regenerates the views, which modifies them.
             return arguments.get("refresh", True) is not False

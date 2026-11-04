@@ -242,15 +242,19 @@ class DocumentTools:
                 "name": "catia_activate_document",
                 "description": (
                     "Bring an open document (V5, by name e.g. 'Part1.CATPart') or editor "
-                    "window (3DEXPERIENCE, by title or window caption) to the front so "
-                    "the next tools act on it. Most tools act on the active one."
+                    "window (3DEXPERIENCE, by PLM id, window caption or part of it) to the "
+                    "front so the next tools act on it. Most tools act on the active one. "
+                    "Prefer the PLM id (from catia_list_documents / catia_status): window "
+                    "captions keep the old title after a rename."
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": "Document name, title, or part of the window caption",
+                            "description": (
+                                "PLM id, document name, title, or part of the window caption"
+                            ),
                         },
                     },
                     "required": ["name"],
@@ -676,6 +680,33 @@ class DocumentTools:
                 pass
         return json.dumps(info, indent=2, ensure_ascii=False)
 
+    def _activate_by_plm_id(self, windows: list[Any], plm_id: str) -> str | None:
+        """Bring forward the window whose object has this PLM id. Windows do
+        not expose their object's id, so each is activated and read in turn;
+        the original window is restored when none matches. Captions keep the
+        old title after a rename (field report 2026-11-03), ids do not change."""
+        from catia_mcp import guard
+
+        wanted = plm_id.strip().lower()
+        if not wanted or " " in wanted:
+            return None  # ids have no spaces: a title, not an id
+        original = safe_get(self.conn.app, "ActiveWindow")
+        for window in windows:
+            try:
+                window.Activate()
+                target = guard.active_target(self.conn)
+            except Exception:  # noqa: BLE001 -- e.g. a window with no PLM object
+                continue
+            if str(target.get("id") or "").lower() == wanted:
+                caption = safe_get(window, "Caption", plm_id)
+                return f"Window '{caption}' activated (PLM id {plm_id}){self._describe_save_target()}."
+        if original is not None:
+            try:
+                original.Activate()
+            except Exception:  # noqa: BLE001 -- best effort
+                pass
+        return None
+
     def _activate_document(self, name: str) -> str:
         self.conn.ensure_connected()
         if not self.conn.is_3dx:
@@ -693,10 +724,15 @@ class DocumentTools:
         exact = [w for w, c in zip(windows, captions) if c == name] or [
             w for w, c in zip(windows, captions) if c.lower() == name.lower()
         ]
+        if not exact:
+            found = self._activate_by_plm_id(windows, name)
+            if found is not None:
+                return found
         matches = exact or [w for w, c in zip(windows, captions) if name.lower() in c.lower()]
         if not matches:
             raise ObjectNotFound(
-                f"No 3DEXPERIENCE window matches '{name}'. Windows: {', '.join(captions) or 'none'}."
+                f"No 3DEXPERIENCE window matches '{name}' by caption or PLM id. Windows: "
+                f"{', '.join(captions) or 'none'}."
             )
         if len(matches) > 1:
             raise AmbiguousTarget(

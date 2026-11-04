@@ -243,3 +243,71 @@ def test_owner_matching_tolerates_domains_and_learns_the_login(monkeypatch):
     monkeypatch.setenv("USERNAME", "jdoe")  # Windows name differs from the login
     guard.learn_login("jane.doe")
     assert guard.current_user() == "jane.doe"
+
+
+@pytest.mark.parametrize(
+    "target_id",
+    ["prd-1", "PRD-1", "test part B", "test part B A:1", "old name A:2", "old name"],
+)
+def test_target_id_accepts_id_title_or_window_caption(target_id):
+    # After a rename the window keeps its old caption plus "A:1" suffixes.
+    target = {"id": "prd-1", "title": "test part B", "caption": "old name A:2",
+              "owner": None, "state": None}
+    assert guard.matches_target(target, target_id)
+    assert not guard.matches_target(target, "prd-2")
+    assert not guard.matches_target(target, "test part")
+
+
+def test_activate_document_finds_a_window_by_plm_id(monkeypatch):
+    from catia_mcp.tools.document import DocumentTools
+
+    class Window:
+        def __init__(self, caption, plm_id):
+            self.Caption, self.plm_id = caption, plm_id
+
+        def Activate(self):
+            app.ActiveWindow = self
+
+    class Windows(list):
+        @property
+        def Count(self):
+            return len(self)
+
+        def Item(self, i):
+            return self[i - 1]
+
+    old = Window("old name A:1", "prd-7")  # caption stale after a rename
+    other = Window("Drawing1 A:1", "dwg-1")
+    app = SimpleNamespace(Windows=Windows([other, old]), ActiveWindow=other)
+    conn = SimpleNamespace(is_3dx=True, app=app, ensure_connected=lambda: None)
+    monkeypatch.setattr(
+        guard, "active_target",
+        lambda c, entity=None: {"id": app.ActiveWindow.plm_id, "title": "new name",
+                                "owner": None, "state": None, "caption": app.ActiveWindow.Caption},
+    )
+    tools = DocumentTools.__new__(DocumentTools)
+    tools.conn = conn
+    text = tools._activate_document("prd-7")
+    assert app.ActiveWindow is old and "PLM id prd-7" in text
+    with pytest.raises(Exception, match="by caption or PLM id"):
+        tools._activate_document("prd-404")
+    assert app.ActiveWindow is old  # restored to the window in front before the search
+
+
+def test_read_only_script_may_read_a_released_drawing(monkeypatch):
+    async def body():
+        server = CATIAMCPServer(allow_scripts=True)
+        server.connection.app = SimpleNamespace(Caption="CATIA R428")
+        server.connection.platform = "3dx"
+        released = {"title": "100200 BRACKET", "id": "dwg-5", "owner": "other.user",
+                    "state": "RELEASED"}
+        monkeypatch.setattr(guard, "active_target", lambda conn, entity=None: released)
+        try:
+            read = await server.call_tool("catia_run_python", {"code": "result = catia.Caption"})
+            assert not read.isError and read.structuredContent["effects"]["modified"] is False
+            write = await server.call_tool("catia_run_python", {"code": "catia.Caption = 'x'"})
+            assert write.structuredContent["code"] == "WRITE_PROTECTED"
+        finally:
+            await server.close()
+
+    run(body())

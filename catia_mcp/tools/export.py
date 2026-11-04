@@ -16,6 +16,7 @@ export only succeeds once the output file is verified on disk.
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import math
@@ -55,6 +56,15 @@ FORMAT_MAP = {
 # CatCaptureFormat: 2 = TIFF, 4 = BMP, 5 = JPEG (no PNG in CATIA V5).
 _CAPTURE_FORMATS = {".jpg": 5, ".jpeg": 5, ".bmp": 4, ".tif": 2, ".tiff": 2}
 _KEEP_CAPTURES = 50
+
+# Settle time after forcing a redraw, and the longer one before the single
+# recapture of an image identical to the previous one. Field report
+# 2026-11-04: after a scripted Viewpoint2D zoom, fit=false captures came
+# back byte-identical three times while the drawing had changed. The
+# refresh recipe below (Viewer.Update, RefreshDisplay toggle, settle) is
+# UNVERIFIED live; the identical-bytes check is what reports the problem.
+_SETTLE_S = 0.3
+_RETRY_SETTLE_S = 1.0
 
 Vec = tuple[float, float, float]
 
@@ -207,6 +217,9 @@ class ExportTools:
 
     def __init__(self, connection: CATIAConnection) -> None:
         self.conn = connection
+        # SHA-256 of the previous capture of this server session, to catch
+        # a stale viewer (an image byte-identical to the last one).
+        self._last_capture_digest: str | None = None
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
         return [
@@ -256,7 +269,12 @@ class ExportTools:
                     "saved as .jpg). The image size is the CATIA viewer's size: CATIA "
                     "cannot render at an arbitrary resolution, so the returned copy is "
                     "only downscaled to max_size when Pillow is installed. Fails if no "
-                    "new file appears on disk."
+                    "new file appears on disk. The viewer is refreshed before capture; "
+                    "with fit=false a capture byte-identical to the previous one is "
+                    "retried once after another refresh and flagged 'possibly_stale' if "
+                    "still identical. For drawings (2D viewers), 'origin' [x, y] and "
+                    "'zoom' set the 2D viewpoint before capture (fit then defaults to "
+                    "false)."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -275,8 +293,29 @@ class ExportTools:
                         },
                         "fit": {
                             "type": "boolean",
-                            "description": "Fit all geometry before capture (default true)",
+                            "description": (
+                                "Fit all geometry before capture (default true; false "
+                                "when origin or zoom is given)"
+                            ),
                             "default": True,
+                        },
+                        "origin": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "description": (
+                                "2D viewers only (drawings): viewpoint origin [x, y] in "
+                                "sheet mm, set with Viewpoint2D.PutOrigin before capture"
+                            ),
+                        },
+                        "zoom": {
+                            "type": "number",
+                            "exclusiveMinimum": 0,
+                            "description": (
+                                "2D viewers only (drawings): Viewpoint2D.Zoom set before "
+                                "capture"
+                            ),
                         },
                         "return_image": {
                             "type": "boolean",
@@ -475,9 +514,115 @@ class ExportTools:
             "Verify with catia_screenshot."
         )
 
+    def _refresh(self, viewer: Any, settle: float) -> list[str]:
+        """Force a redraw before capturing; returns what was done.
+
+        Viewer.Update is documented on V5 Viewer; the RefreshDisplay toggle
+        (Application property) re-enables display refresh. Both are best
+        effort and UNVERIFIED as a cure for stale captures on R428."""
+        done: list[str] = []
+        if name_exists(viewer, "Update"):
+            try:
+                viewer.Update()
+                done.append("Viewer.Update")
+            except Exception:  # noqa: BLE001, S110 -- redraw is best effort
+                pass
+        app = self.conn.app
+        if app is not None and name_exists(app, "RefreshDisplay"):
+            toggled = False
+            try:
+                app.RefreshDisplay = False
+                toggled = True
+            except Exception:  # noqa: BLE001, S110 -- redraw is best effort
+                pass
+            finally:
+                # Never leave display refresh off, whatever happened above:
+                # the capture (and the user's session) needs it on.
+                try:
+                    app.RefreshDisplay = True
+                except Exception:  # noqa: BLE001
+                    toggled = False
+                    done.append("RefreshDisplay could not be re-enabled")
+            if toggled:
+                done.append("RefreshDisplay toggled")
+        if settle > 0:
+            time.sleep(settle)
+        return done
+
+    @staticmethod
+    def _apply_2d(viewer: Any, origin: Any, zoom: Any) -> dict[str, Any]:
+        """Field-proven on R428 SP6 (field report 2026-11-04):
+        ActiveWindow.ActiveViewer.Viewpoint2D.PutOrigin([x, y]) and .Zoom."""
+        viewpoint = safe_get(viewer, "Viewpoint2D") if name_exists(viewer, "Viewpoint2D") else None
+        if viewpoint is None:
+            raise UnsupportedCapability(
+                "origin/zoom apply to 2D viewers only (drawing windows); the active "
+                "viewer has no Viewpoint2D. For 3D views use 'view' and 'fit'."
+            )
+        applied: dict[str, Any] = {}
+        if origin is not None:
+            viewpoint.PutOrigin([float(origin[0]), float(origin[1])])
+            applied["origin"] = [float(origin[0]), float(origin[1])]
+        if zoom is not None:
+            viewpoint.Zoom = float(zoom)
+            read = safe_get(viewpoint, "Zoom")
+            applied["zoom"] = float(read) if isinstance(read, (int, float)) else float(zoom)
+        return applied
+
+    @staticmethod
+    def _parse_2d(arguments: dict[str, Any]) -> tuple[Any, Any]:
+        origin = arguments.get("origin")
+        zoom = arguments.get("zoom")
+        if origin is not None:
+            try:
+                ok = len(origin) == 2 and all(math.isfinite(float(v)) for v in origin)
+            except (TypeError, ValueError):
+                ok = False
+            if not ok:
+                raise InvalidArgument("origin must be [x, y] (two finite numbers).")
+        if zoom is not None:
+            try:
+                ok = math.isfinite(float(zoom)) and float(zoom) > 0
+            except (TypeError, ValueError):
+                ok = False
+            if not ok:
+                raise InvalidArgument("zoom must be a finite number greater than 0.")
+        if (origin is not None or zoom is not None) and arguments.get("view"):
+            raise InvalidArgument("'view' is a 3D preset; it cannot be combined with origin/zoom.")
+        if (origin is not None or zoom is not None) and arguments.get("fit") is True:
+            raise InvalidArgument(
+                "fit=true would reframe and undo origin/zoom; omit fit or pass fit=false."
+            )
+        return origin, zoom
+
+    @staticmethod
+    def _digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _capture_checked(self, viewer: Any, path: Path, fit: bool, info: dict[str, Any]) -> None:
+        """Capture; with fit=false, recapture once after another refresh when
+        the bytes equal the previous capture of this session."""
+        self._capture(viewer, path)
+        digest = self._digest(path)
+        if not fit and digest == self._last_capture_digest:
+            self._refresh(viewer, _RETRY_SETTLE_S)
+            self._capture(viewer, path)
+            digest = self._digest(path)
+            info["recaptured"] = True
+            if digest == self._last_capture_digest:
+                info["possibly_stale"] = True
+                info.setdefault("warnings", []).append(
+                    "Possibly stale: the image is byte-identical to the previous capture "
+                    "even after a refresh and recapture. If the view changed since, "
+                    "retry with fit=true (always current in field use)."
+                )
+        self._last_capture_digest = digest
+
     def _screenshot(self, arguments: dict[str, Any]) -> list[Any]:
         view = arguments.get("view")
-        fit = arguments.get("fit", True)
+        origin_2d, zoom_2d = self._parse_2d(arguments)
+        uses_2d = origin_2d is not None or zoom_2d is not None
+        fit = arguments.get("fit", not uses_2d)
         return_image = arguments.get("return_image", True)
         max_size = _int_arg(arguments, "max_size", 1280, 64, 4096)
         orientation = resolve_view(view, None, None) if view else None
@@ -508,39 +653,38 @@ class ExportTools:
             warnings.append("Unknown image extension; saved as .jpg")
 
         viewer = self._viewer()
+        applied_2d = self._apply_2d(viewer, origin_2d, zoom_2d) if uses_2d else None
         if orientation is not None:
             self._apply_view(viewer, orientation[1], orientation[2])
         if fit:
             viewer.Reframe()
-        # Viewer.Update forces a redraw before capturing so the image shows
-        # the new orientation. Documented on V5 Viewer; needs live validation
-        # on 3DEXPERIENCE R428 (skipped silently when absent).
-        if name_exists(viewer, "Update"):
-            try:
-                viewer.Update()
-            except Exception:  # noqa: BLE001, S110 -- redraw is best effort
-                pass
+        # Force a redraw (and let it settle) so the image shows the current
+        # state, not the previous frame.
+        refreshed = self._refresh(viewer, _SETTLE_S)
 
+        info: dict[str, Any] = {
+            "path": str(path),
+            "view": orientation[0] if orientation else None,
+        }
+        if applied_2d is not None:
+            info["viewpoint_2d"] = applied_2d
         if convert_to_png:
             # A private intermediate name: <name>.bmp may be a user's own file
             # next to the requested PNG and must not be overwritten or deleted.
             capture_path = path.with_name(f"{path.stem}.{uuid4().hex[:8]}.capture.bmp")
             try:
-                self._capture(viewer, capture_path)
+                self._capture_checked(viewer, capture_path, fit, info)
                 with _pillow().open(capture_path) as img:
                     img.save(path, format="PNG")
             finally:
                 capture_path.unlink(missing_ok=True)
         else:
-            self._capture(viewer, path)
+            self._capture_checked(viewer, path, fit, info)
 
-        info: dict[str, Any] = {
-            "path": str(path),
-            "view": orientation[0] if orientation else None,
-            "bytes": path.stat().st_size,
-        }
+        info["bytes"] = path.stat().st_size
+        info["refresh"] = refreshed
         if warnings:
-            info["warnings"] = warnings
+            info.setdefault("warnings", []).extend(warnings)
         content: list[Any] = []
         if return_image:
             image_path = path

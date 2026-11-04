@@ -154,3 +154,29 @@ def com_name(obj: Any, default: str = "<unnamed>") -> str:
         return str(obj.Name)
     except Exception:
         return default
+
+
+# DISPATCH_PROPERTYPUT (oaidl.h).
+DISPATCH_PROPERTYPUT = 4
+
+
+def put_property_raw(obj: Any, name: str, value: Any) -> None:
+    """Set `obj.name = value` through a raw IDispatch::Invoke with
+    DISPATCH_PROPERTYPUT.
+
+    Field-proven on R428 SP6 (field report 2026-11-04) for Affinity.AxisOrigin,
+    a Reference-typed property that pywin32 attribute assignment ("can not be
+    set"), VBScript `Set` and DISPATCH_PROPERTYPUTREF ("Member not found") all
+    refuse. The value is passed as its IDispatch (``_oleobj_``) when it is a
+    COM wrapper, as-is otherwise (scalars).
+    """
+    _check_identifier(name)
+    ole = getattr(obj, "_oleobj_", None)
+    if ole is None:
+        raise TypeError(f"{name}: the target is not a COM object (no _oleobj_)")
+    dispid = ole.GetIDsOfNames(name)
+    if isinstance(dispid, (tuple, list)):
+        dispid = dispid[0]
+    value_ole = getattr(value, "_oleobj_", value)
+    # Invoke(dispid, lcid, wFlags, bResultWanted, *args)
+    ole.Invoke(dispid, 0, DISPATCH_PROPERTYPUT, False, value_ole)

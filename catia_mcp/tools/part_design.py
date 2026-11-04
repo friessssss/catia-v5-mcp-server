@@ -16,11 +16,23 @@ import json
 import math
 from typing import Any
 
-from catia_mcp.automation import call_fill_array, com_name, iter_items, name_exists
+from catia_mcp.automation import (
+    call_fill_array,
+    com_name,
+    iter_items,
+    name_exists,
+    put_property_raw,
+)
 from catia_mcp.connection import CATIAConnection
-from catia_mcp.errors import CATIAToolError, InvalidArgument, ObjectNotFound, UnsupportedCapability
+from catia_mcp.errors import (
+    CATIAToolError,
+    InvalidArgument,
+    ObjectNotFound,
+    UnsupportedCapability,
+    after_mutation,
+)
 from catia_mcp.introspect import type_name
-from catia_mcp.measure import Measurer
+from catia_mcp.measure import Measurer, body_has_solid, body_vertex_box, box_dims, empty_body_hint
 from catia_mcp.references import (
     body_by_name,
     find_element,
@@ -562,7 +574,11 @@ class PartDesignTools:
                 "name": "catia_thickness",
                 "description": (
                     "Add or remove thickness from faces of a solid. "
-                    "Offsets faces inward or outward."
+                    "Offsets faces inward or outward. Caution (field-proven on "
+                    "3DEXPERIENCE R428 SP6): CATIA also offsets every face "
+                    "tangent-connected to the chosen one, so fillets and side walls "
+                    "grow too. To grow a body uniformly along one axis, use "
+                    "catia_scale_body instead."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -577,6 +593,62 @@ class PartDesignTools:
                         },
                     },
                     "required": ["offset"],
+                },
+            },
+            {
+                "name": "catia_scale_body",
+                "description": (
+                    "Scale one body of the active part per axis with a Part Design "
+                    "Affinity (ShapeFactory.AddNewAffinity2). Give 'axis' + 'ratio' "
+                    "(e.g. axis='z', ratio=1.0012 grows only Z) or 'ratios' [x, y, z]. "
+                    "The scaling origin stays fixed: a point name, 'xy-origin' "
+                    "(default, the absolute origin) or [x, y, z] coordinates (a "
+                    "point is created in the 'MCP_Construction' geometrical set). "
+                    "Verified by the body's bounding box before and after (expected "
+                    "dimensions = before x ratio). Unlike catia_thickness, this does "
+                    "not spill onto tangent-connected faces. Affinity axes are the "
+                    "absolute X/Y/Z axes."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "body_name": {
+                            "type": "string",
+                            "description": "Body to scale (default: the active body)",
+                        },
+                        "axis": {
+                            "type": "string",
+                            "enum": ["x", "y", "z"],
+                            "description": "Single axis to scale (with 'ratio')",
+                        },
+                        "ratio": {
+                            "type": "number",
+                            "exclusiveMinimum": 0,
+                            "description": "Scale ratio along 'axis' (1 = unchanged)",
+                        },
+                        "ratios": {
+                            "type": "array",
+                            "items": {"type": "number", "exclusiveMinimum": 0},
+                            "minItems": 3,
+                            "maxItems": 3,
+                            "description": "[x_ratio, y_ratio, z_ratio] (instead of axis + ratio)",
+                        },
+                        "origin": {
+                            "description": (
+                                "Fixed point of the scaling: a point's tree name, "
+                                "'xy-origin' (default) or [x, y, z] in mm"
+                            ),
+                            "oneOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "array",
+                                    "items": {"type": "number"},
+                                    "minItems": 3,
+                                    "maxItems": 3,
+                                },
+                            ],
+                        },
+                    },
                 },
             },
             {
@@ -894,6 +966,8 @@ class PartDesignTools:
                 return self._draft(arguments)
             case "catia_thickness":
                 return self._thickness(arguments)
+            case "catia_scale_body":
+                return self._scale_body(arguments)
             case "catia_delete_feature":
                 return self._delete_feature(arguments)
             case "catia_list_features":
@@ -2450,6 +2524,180 @@ class PartDesignTools:
         part.UpdateObject(thickness)
         self.conn.refresh_display()
         return f"Thickness added: {offset} mm on {face_name}. Feature: '{thickness.Name}'"
+
+    # ── Scale body (Affinity) ──
+
+    _ORIGIN_ALIASES = ("xy-origin", "origin", "absolute", "absolute-origin")
+
+    @staticmethod
+    def _scale_ratios(args: dict[str, Any]) -> list[float]:
+        ratios = args.get("ratios")
+        axis = args.get("axis")
+        ratio = args.get("ratio")
+        if ratios is not None and (axis is not None or ratio is not None):
+            raise InvalidArgument("Pass either 'ratios' or 'axis' + 'ratio', not both.")
+        if ratios is None:
+            if axis not in ("x", "y", "z") or ratio is None:
+                raise InvalidArgument(
+                    "catia_scale_body needs 'axis' ('x', 'y' or 'z') with 'ratio', "
+                    "or 'ratios' [x, y, z]."
+                )
+            ratios = [1.0, 1.0, 1.0]
+            ratios["xyz".index(axis)] = ratio
+        try:
+            values = [float(r) for r in ratios]
+        except (TypeError, ValueError):
+            raise InvalidArgument("ratios must be numbers.") from None
+        if len(values) != 3 or not all(math.isfinite(v) and v > 0 for v in values):
+            raise InvalidArgument("Scale ratios must be 3 finite numbers greater than 0.")
+        if all(abs(v - 1.0) < 1e-12 for v in values):
+            raise InvalidArgument("Every ratio is 1: the body would not change.")
+        return values
+
+    @classmethod
+    def _parse_origin(cls, origin: Any) -> tuple[str, Any]:
+        """('coords', [x, y, z]) or ('name', point name)."""
+        if origin is None:
+            return "coords", [0.0, 0.0, 0.0]
+        if isinstance(origin, str):
+            if origin.strip().lower() in cls._ORIGIN_ALIASES:
+                return "coords", [0.0, 0.0, 0.0]
+            if not origin.strip():
+                raise InvalidArgument("origin must not be empty.")
+            return "name", origin.strip()
+        if isinstance(origin, (list, tuple)) and len(origin) == 3:
+            try:
+                coords = [float(c) for c in origin]
+            except (TypeError, ValueError):
+                raise InvalidArgument("origin coordinates must be numbers.") from None
+            if all(math.isfinite(c) for c in coords):
+                return "coords", coords
+        raise InvalidArgument("origin must be a point name, 'xy-origin' or [x, y, z].")
+
+    def _origin_reference(self, part: Any, kind: str, value: Any) -> tuple[Any, str]:
+        if kind == "name":
+            point = find_element(part, value)
+            return part.CreateReferenceFromObject(point), f"point '{value}'"
+        x, y, z = value
+        point = part.HybridShapeFactory.AddNewPointCoord(x, y, z)
+        self._construction_geoset(part).AppendHybridShape(point)
+        part.UpdateObject(point)
+        label = f"point '{com_name(point)}' at ({x:g}, {y:g}, {z:g}) mm"
+        return part.CreateReferenceFromObject(point), label
+
+    def _body_box(self, body: Any) -> dict[str, Any] | None:
+        """Vertex box of the body, or None when unreadable. A sweep capped at
+        BOX_VERTEX_CAP vertices is not comparable before/after (the capped
+        subset can differ), so it counts as unreadable too."""
+        try:
+            box = body_vertex_box(self.measure, self.conn.hso, body, is_3dx=self.conn.is_3dx)
+        except Exception:
+            return None
+        return None if box.get("truncated") else box
+
+    @staticmethod
+    def _read_ratio(affinity: Any, name: str) -> float | None:
+        try:
+            value = getattr(affinity, name)
+            value = getattr(value, "Value", value)
+            return float(value)
+        except Exception:
+            return None
+
+    def _scale_body(self, args: dict[str, Any]) -> str:
+        """Affinity on one body.
+
+        Field-proven on R428 SP6 (field report 2026-11-03/04):
+        ShapeFactory.AddNewAffinity2(1, 1, ratio) scaled a body along Z only;
+        Affinity.AxisOrigin refuses pywin32 assignment, VBScript Set and
+        DISPATCH_PROPERTYPUTREF, and is set only through a raw IDispatch
+        Invoke with DISPATCH_PROPERTYPUT (automation.put_property_raw).
+        UNVERIFIED: creating the origin point here, the default absolute
+        axis directions, and the read-back of XRatio/YRatio/ZRatio; the
+        bounding box comparison is what proves the result."""
+        self.conn.ensure_connected()
+        ratios = self._scale_ratios(args)
+        origin_kind, origin_value = self._parse_origin(args.get("origin"))
+        part = self.conn.get_active_part()
+        body_name = args.get("body_name")
+        body = body_by_name(part, body_name) if body_name else self.conn.get_active_part_body()
+        if not body_has_solid(body):
+            hint = empty_body_hint(part, body)
+            raise InvalidArgument(
+                f"Body '{com_name(body)}' has no solid features to scale."
+                + (f" {hint}" if hint else "")
+            )
+        if origin_kind == "name":
+            # Resolve before any change so a bad name modifies nothing.
+            find_element(part, origin_value)
+        before = self._body_box(body)
+
+        with after_mutation():
+            origin_ref, origin_label = self._origin_reference(part, origin_kind, origin_value)
+            part.InWorkObject = body
+            affinity = part.ShapeFactory.AddNewAffinity2(*ratios)
+            try:
+                put_property_raw(affinity, "AxisOrigin", origin_ref)
+            except Exception as e:
+                removed = self._remove_feature(affinity)
+                raise CATIAToolError(
+                    f"Setting Affinity.AxisOrigin failed ({e}). The affinity was "
+                    + ("removed." if removed else
+                       f"left in the tree: delete '{com_name(affinity)}' with catia_delete_feature.")
+                    + " Origin construction point kept: " + origin_label + ".",
+                    modified=None,
+                ) from e
+            self._safe_update(part, affinity)
+            self.conn.refresh_display()
+
+        read_back = {
+            axis: self._read_ratio(affinity, f"{axis.upper()}Ratio") for axis in "xyz"
+        }
+        mismatched = [
+            axis for axis, want in zip("xyz", ratios)
+            if read_back[axis] is not None and abs(read_back[axis] - want) > 1e-9 * max(1.0, want)
+        ]
+        if mismatched:
+            raise CATIAToolError(
+                f"Affinity '{com_name(affinity)}' reads back ratios {read_back} instead "
+                f"of {dict(zip('xyz', ratios))}. Delete it with catia_delete_feature.",
+                modified=True,
+            )
+
+        after = self._body_box(body)
+        summary = (
+            f"Scaled body '{com_name(body)}' with Affinity '{com_name(affinity)}': "
+            f"ratios x={ratios[0]:g}, y={ratios[1]:g}, z={ratios[2]:g} about {origin_label}."
+        )
+        if before is None or after is None:
+            return summary + (
+                " NOT verified: the bounding box could not be read before/after "
+                "(no vertices, or more than the vertex-sweep cap). Check with "
+                "catia_get_bounding_box or a screenshot."
+            )
+        dims_before = box_dims(before)
+        dims_after = box_dims(after)
+        expected = [d * r for d, r in zip(dims_before, ratios)]
+        bad = [
+            i for i in range(3)
+            if abs(dims_after[i] - expected[i]) > max(1e-3, 1e-5 * abs(expected[i]))
+        ]
+
+        def fmt(values: list[float]) -> str:
+            return " x ".join(f"{v:.4f}" for v in values)
+
+        if bad:
+            raise CATIAToolError(
+                f"{summary} Bounding box check FAILED on "
+                f"{', '.join('xyz'[i] for i in bad)}: before {fmt(dims_before)} mm, "
+                f"expected {fmt(expected)} mm, got {fmt(dims_after)} mm. Delete "
+                f"'{com_name(affinity)}' with catia_delete_feature if this is wrong.",
+                modified=True,
+            )
+        return (
+            f"{summary} Verified by bounding box: {fmt(dims_before)} -> "
+            f"{fmt(dims_after)} mm (expected {fmt(expected)})."
+        )
 
     def _delete_feature(self, args: dict[str, Any]) -> str:
         self.conn.ensure_connected()

@@ -48,6 +48,7 @@ EXEMPT = frozenset(
         "catia_activate_document",
         "catia_close_document",  # guarded by the server when save=true
         "catia_export",  # writes a file, never the model or the database
+        "catia_drawing_print",  # prints sheets to files; the drawing is unchanged
         "catia_set_view",
         "catia_fit_all",
         "catia_screenshot",
@@ -197,7 +198,34 @@ def active_target(conn: Any, entity: Any = None) -> dict[str, Any]:
             break
     if info["title"] is None:
         info["title"] = str(safe_get(obj, "Name", "") or "") or None
+    info["caption"] = str(safe_get(safe_get(conn.app, "ActiveWindow"), "Caption", "") or "") or None
     return info
+
+
+# Window captions carry the revision and window number after the title
+# ("PART A:1", "PART A.1:2") and keep the old title after a rename (field
+# report 2026-11-03).
+_CAPTION_SUFFIX = re.compile(r"\s+[A-Z]{1,3}(?:\.\d+)?:\d+$")
+_WINDOW_NUMBER = re.compile(r":\d+$")
+
+
+def _caption_forms(caption: str | None) -> set[str]:
+    if not caption:
+        return set()
+    text = caption.strip()
+    return {text.lower(), _WINDOW_NUMBER.sub("", text).lower(), _CAPTION_SUFFIX.sub("", text).lower()}
+
+
+def matches_target(target: dict[str, Any], target_id: str) -> bool:
+    """target_id names the object by PLM id (stable), by title, or by window
+    caption with or without its ' A:1' revision:window suffix."""
+    wanted = target_id.strip()
+    if target.get("id") and wanted.lower() == str(target["id"]).lower():
+        return True
+    names = _caption_forms(target.get("caption"))
+    if target.get("title"):
+        names.add(str(target["title"]).strip().lower())
+    return wanted.lower() in names or _CAPTION_SUFFIX.sub("", wanted).lower() in names
 
 
 def _norm(value: str | None) -> str:
@@ -216,14 +244,13 @@ def check(
     an already read `target` to avoid reading the attributes twice."""
     target = target if target is not None else active_target(conn)
     shown = target["title"] or target["id"] or "the active window"
-    if target_id:
-        wanted = target_id.strip().lower()
-        if wanted not in {(target["id"] or "").lower(), (target["title"] or "").lower()}:
-            raise TargetMismatch(
-                f"{tool} was meant for '{target_id}', but the active CATIA window shows "
-                f"'{shown}' (id {target['id'] or 'unknown'}). Nothing was changed. "
-                "Activate the right window with catia_activate_document, then retry."
-            )
+    if target_id and not matches_target(target, target_id):
+        raise TargetMismatch(
+            f"{tool} was meant for '{target_id}', but the active CATIA window shows "
+            f"'{shown}' (id {target['id'] or 'unknown'}). Nothing was changed. "
+            "Activate the right window with catia_activate_document (it accepts the PLM "
+            "id), then retry. Prefer the PLM id as target_id: titles change on rename."
+        )
     if override:
         return target
     owner = target["owner"]

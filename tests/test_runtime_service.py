@@ -339,3 +339,24 @@ def test_run_python_exposes_out_parameter_helpers():
 
     run(body())
     assert "o.GetCoordinates a" in calls[0][1] and "o.GetDirection r0, r1" in calls[1][1]
+
+
+@pytest.mark.parametrize(
+    ("code", "read_only"),
+    [
+        ("names = [b.Name for b in part().Bodies]\nresult = names", True),
+        ("rows = []\nrows.append(catia.Caption)\nresult = rows", True),
+        ("session['n'] = 1", True),
+        ("part().Bodies.Item(1).Name = 'X'", False),
+        ("part().Update()", False),
+        ("sel = editor().Selection\nsel.Delete()", False),
+        ("v = vbscript('Function F(): End Function', 'F')", False),
+        ("dim.GetValue().SetFormatPrecision(1, 0.001)", False),
+    ],
+)
+def test_run_python_static_read_only_detection(code, read_only):
+    import ast
+
+    from catia_mcp.tools.introspection import _looks_read_only
+
+    assert _looks_read_only(ast.parse(code)) is read_only

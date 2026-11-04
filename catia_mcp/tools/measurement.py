@@ -11,18 +11,40 @@ import json
 import re
 from typing import Any
 
-from catia_mcp.automation import call_fill_array
+from catia_mcp.automation import call_fill_array, com_name, safe_get
 from catia_mcp.connection import CATIAConnection
+from catia_mcp.errors import InvalidArgument, ObjectNotFound
 from catia_mcp.measure import (
     M2_TO_MM2,
     M3_TO_MM3,
     M_TO_MM,
     UNIT_NOTE_3DX,
     Measurer,
+    bodies_with_solid,
+    body_has_solid,
+    body_vertex_box,
+    box_dims,
+    empty_body_hint,
     inertia_cog_to_mm,
     significant,
 )
-from catia_mcp.references import search_final_topology
+from catia_mcp.references import body_by_name, search_final_topology
+
+_ALL_BODIES = "all"
+
+
+def _is_all(body_name: Any) -> bool:
+    return isinstance(body_name, str) and body_name.strip().lower() == _ALL_BODIES
+
+_BODY_NAME_SCHEMA = {
+    "type": "string",
+    "description": (
+        "Body to measure (e.g. 'Body.2'). Default: the active body (catia_set_active_body, "
+        "else the main body). 'all' = every body with solid content."
+    ),
+}
+
+_READ_ONLY = {"readOnlyHint": True, "openWorldHint": False}
 
 # CATIA V5's SPAWorkbench Measurable API returns every value in MKS units
 # (meters, m2, m3, kg.m2) regardless of the document's display units.
@@ -50,6 +72,7 @@ class MeasurementTools:
     def __init__(self, connection: CATIAConnection) -> None:
         self.conn = connection
         self.measure = Measurer(connection)
+        self._skipped_operands: list[str] = []
 
     def reset_session_state(self) -> None:
         """Drop per-session caches (CATMeasurableType codes / enum). The
@@ -85,11 +108,15 @@ class MeasurementTools:
             {
                 "name": "catia_get_inertia",
                 "description": (
-                    "Get inertia properties of the active part: volume (mm3 and cm3), "
+                    "Get inertia properties of a body of the active part (default: the "
+                    "active body; body_name picks another, 'all' measures every body "
+                    "with solid content and sums volume and mass): volume (mm3 and cm3), "
                     "surface area (mm2 and cm2), center of gravity (mm), mass in kg "
                     "(if a density is passed), inertia matrix (kg.m2, from the material "
                     "density defined in CATIA). All values are converted server-side "
-                    "from CATIA's internal MKS measurement units."
+                    "from CATIA's internal MKS measurement units. An empty body is "
+                    "reported as empty (naming the bodies that hold geometry), not as "
+                    "zeros."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -98,8 +125,10 @@ class MeasurementTools:
                             "type": "number",
                             "description": "Material density in kg/m3 (optional, for mass calculation)",
                         },
+                        "body_name": _BODY_NAME_SCHEMA,
                     },
                 },
+                "annotations": _READ_ONLY,
             },
             {
                 "name": "catia_get_bounding_box",
@@ -107,12 +136,15 @@ class MeasurementTools:
                     "Get the bounding box of the active part from a vertex "
                     "sweep of the final shape, in mm. Exact for planar-faced "
                     "solids; curved faces may extend beyond the reported "
-                    "bounds (stated in the result)."
+                    "bounds (stated in the result). Default: the active body; "
+                    "body_name picks another, 'all' boxes every body with solid "
+                    "content (per body and combined)."
                 ),
                 "inputSchema": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {"body_name": _BODY_NAME_SCHEMA},
                 },
+                "annotations": _READ_ONLY,
             },
             {
                 "name": "catia_get_parameters",
@@ -182,9 +214,9 @@ class MeasurementTools:
             case "catia_measure_distance":
                 return self._measure_distance(arguments["element1"], arguments["element2"])
             case "catia_get_inertia":
-                return self._get_inertia(arguments.get("density"))
+                return self._get_inertia(arguments.get("density"), arguments.get("body_name"))
             case "catia_get_bounding_box":
-                return self._get_bounding_box()
+                return self._get_bounding_box(arguments.get("body_name"))
             case "catia_get_parameters":
                 return self._get_parameters(arguments.get("filter"))
             case "catia_set_parameter":
@@ -262,19 +294,105 @@ class MeasurementTools:
             f"{measured['distance_mm']:.4f} mm{points}{note}"
         )
 
-    def _get_inertia(self, density: float | None = None) -> str:
+    def _bodies(self, part: Any, body_name: str | None) -> tuple[list[Any], str | None]:
+        """Bodies to measure and, for the default single body, an empty-body
+        hint. 'all' = every top-level body with solid features."""
+        self._skipped_operands = []
+        if _is_all(body_name):
+            bodies = bodies_with_solid(part)
+            if not bodies:
+                raise ObjectNotFound("No body of the active part holds solid features.")
+            # A body consumed by a boolean (Add / Remove / Intersect ...) is
+            # already part of its target body's result: summing it again
+            # would double-count. Body.InBooleanOperation is V5 API;
+            # UNVERIFIED on R428 (unreadable = kept).
+            operands = [b for b in bodies if safe_get(b, "InBooleanOperation", False) is True]
+            kept = [b for b in bodies if b not in operands] or bodies
+            self._skipped_operands = [com_name(b) for b in operands if b not in kept]
+            return kept, None
+        if body_name:
+            body = body_by_name(part, body_name)
+        else:
+            body = self.conn.get_active_part_body()
+        return [body], empty_body_hint(part, body)
+
+    def _get_inertia(self, density: float | None = None, body_name: str | None = None) -> str:
         self.conn.ensure_connected()
         part = self.conn.get_active_part()
-        body = self.conn.get_active_part_body()
+        if density is not None and (not isinstance(density, (int, float)) or density <= 0):
+            raise InvalidArgument("density must be a positive number (kg/m3).")
+        bodies, hint = self._bodies(part, body_name)
+        if hint:
+            # Field report 2026-11-03: an empty main body beside the real
+            # geometry read as zeros. Say so instead of measuring nothing.
+            return json.dumps(
+                {"body": com_name(bodies[0]), "empty_body": True, "hint": hint}, indent=2
+            )
+        if len(bodies) == 1 and not _is_all(body_name):
+            result = {"body": com_name(bodies[0])}
+            # An explicitly named body is never silently replaced by the
+            # whole part; the default body keeps the earlier fallback.
+            result.update(
+                self._inertia_one(part, bodies[0], density, whole_part_fallback=not body_name)
+            )
+            if self.conn.is_3dx:
+                result["units_note"] = UNIT_NOTE_3DX
+            return json.dumps(result, indent=2)
 
+        per_body = []
+        for body in bodies:
+            entry = {"body": com_name(body)}
+            entry.update(self._inertia_one(part, body, density, whole_part_fallback=False))
+            per_body.append(entry)
+        result = {"bodies": per_body, "total": self._totals(per_body, density)}
+        if self._skipped_operands:
+            result["skipped_boolean_operands"] = self._skipped_operands
+        if self.conn.is_3dx:
+            result["units_note"] = UNIT_NOTE_3DX
+        return json.dumps(result, indent=2)
+
+    @staticmethod
+    def _totals(per_body: list[dict[str, Any]], density: float | None) -> dict[str, Any]:
+        """Sums over bodies; a total is given only when every body measured."""
+        total: dict[str, Any] = {"body_count": len(per_body)}
+        volumes = [b.get("volume_mm3") for b in per_body]
+        if all(isinstance(v, (int, float)) for v in volumes):
+            volume = sum(volumes)
+            total["volume_mm3"] = round(volume, 4)
+            total["volume_cm3"] = round(volume / 1000.0, 4)
+            if density:
+                mass = density * volume / M3_TO_MM3
+                total["mass_kg"] = round(mass, 6)
+                total["mass_g"] = round(mass * 1000, 3)
+                total["density_kg_m3"] = density
+            cogs = [b.get("center_of_gravity_mm") for b in per_body]
+            if volume > 0 and all(isinstance(c, dict) for c in cogs):
+                total["center_of_gravity_mm"] = {
+                    axis: round(sum(c[axis] * v for c, v in zip(cogs, volumes)) / volume, 4)
+                    for axis in ("x", "y", "z")
+                }
+                total["center_of_gravity_basis"] = "volume-weighted (uniform density assumed)"
+        else:
+            total["volume_mm3"] = "incomplete: not every body could be measured"
+        masses = [b.get("mass_from_material_kg") for b in per_body]
+        if all(isinstance(m, (int, float)) for m in masses):
+            total["mass_from_material_kg"] = round(sum(masses), 6)
+        return total
+
+    def _inertia_one(
+        self, part: Any, body: Any, density: float | None, *, whole_part_fallback: bool
+    ) -> dict[str, Any]:
         result: dict[str, Any] = {}
         volume_m3: float | None = None
 
         try:
+            self.measure.last_volume_source = None
             volume_mm3 = self.measure.volume_mm3(part, body)
             volume_m3 = volume_mm3 / _M3_TO_MM3
             result["volume_mm3"] = round(volume_mm3, 4)
             result["volume_cm3"] = round(volume_m3 * 1e6, 4)
+            if self.measure.last_volume_source:
+                result["volume_source"] = self.measure.last_volume_source
         except Exception as e:
             result["volume_mm3"] = f"unavailable: {e}"
 
@@ -307,8 +425,17 @@ class MeasurementTools:
         try:
             # Inertia data lives on the inertia object (V5 SPAWorkbench
             # Inertias, 3DEXPERIENCE InertiaService), not on Measurable.
-            inertia = self.measure.inertia(part, body)
+            if whole_part_fallback:
+                inertia = self.measure.inertia(part, body)
+            else:
+                inertia = self.measure.inertia(part, body, whole_part_fallback=False)
             result["mass_from_material_kg"] = round(inertia["mass_kg"], 6)
+            target = inertia.get("target")
+            if target and target != "body":
+                result["inertia_target"] = (
+                    f"{target} (InertiaService refused the body itself: mass and "
+                    "matrix are for the whole part, not this body)"
+                )
             matrix = inertia.get("matrix")
             if matrix:
                 # 6 significant figures: moments of a 100 mm part are ~1e-4
@@ -334,71 +461,67 @@ class MeasurementTools:
             except Exception as e:
                 result["inertia_cog_mm"] = f"unavailable: {e}"
             else:
-                if cog is None:
+                if cog is None and inertia.get("target", "body") == "body":
                     # The measurable COG failed: report the inertia COG in
                     # its place, labelled with where it came from.
                     result["center_of_gravity_measurable_error"] = result["center_of_gravity_mm"]
                     result["center_of_gravity_mm"] = dict(result["inertia_cog_mm"])
                     result["center_of_gravity_source"] = "InertiaService (" + unit_basis + ")"
+        return result
 
-        if self.conn.is_3dx:
-            result["units_note"] = UNIT_NOTE_3DX
-        return json.dumps(result, indent=2)
-
-    def _get_bounding_box(self) -> str:
+    def _get_bounding_box(self, body_name: str | None = None) -> str:
         # Measurable has no bounding-box method in any V5 release, so the
         # box is computed from the final shape's vertices (exact for
         # planar-faced solids; curved faces can extend past their vertices,
         # which the output states explicitly).
         self.conn.ensure_connected()
-        self.conn.get_active_part()
-        body = self.conn.get_active_part_body()
-        if body.Shapes.Count == 0:
-            raise RuntimeError("The active body has no solid shape yet.")
-        sel = self.conn.hso
-        refs = []
-        try:
-            count = search_final_topology(sel, body, "Vertex", is_3dx=self.conn.is_3dx)
-            if count == 0:
-                raise RuntimeError(
-                    "UNSUPPORTED_CAPABILITY: the final shape exposes no "
-                    "vertices (fully curved solid); a bounding box cannot be "
-                    "derived through the automation API."
-                )
-            truncated = count > 200
-            if truncated:
-                count = 200  # cap the sweep; stated in the output below
-            for i in range(1, count + 1):
-                refs.append(sel.Item(i).Reference)
-        finally:
-            try:
-                sel.Clear()
-            except Exception:
-                pass
+        part = self.conn.get_active_part()
+        bodies, hint = self._bodies(part, body_name)
+        if hint:
+            raise ObjectNotFound(hint)
+        if not body_has_solid(bodies[0]):
+            raise ObjectNotFound(
+                f"Body '{com_name(bodies[0])}' has no solid shape yet; no bounding box."
+            )
+        boxes = []
+        for body in bodies:
+            box = body_vertex_box(self.measure, self.conn.hso, body, is_3dx=self.conn.is_3dx)
+            boxes.append((com_name(body), box))
 
-        xs, ys, zs = [], [], []
-        for ref in refs:
-            # Vertex coordinates in the document's length unit (mm).
-            pt = self.measure.point_mm(ref)
-            xs.append(pt[0])
-            ys.append(pt[1])
-            zs.append(pt[2])
+        def shaped(box: dict[str, Any]) -> dict[str, Any]:
+            dims = box_dims(box)
+            return {
+                "min": {k: round(v, 4) for k, v in zip("xyz", box["min"])},
+                "max": {k: round(v, 4) for k, v in zip("xyz", box["max"])},
+                "dimensions": {
+                    "length_x": round(dims[0], 4),
+                    "length_y": round(dims[1], 4),
+                    "length_z": round(dims[2], 4),
+                },
+            }
 
-        result = {
-            "min": {"x": round(min(xs), 4), "y": round(min(ys), 4), "z": round(min(zs), 4)},
-            "max": {"x": round(max(xs), 4), "y": round(max(ys), 4), "z": round(max(zs), 4)},
-            "dimensions": {
-                "length_x": round(max(xs) - min(xs), 4),
-                "length_y": round(max(ys) - min(ys), 4),
-                "length_z": round(max(zs) - min(zs), 4),
-            },
-            "method": (
-                f"vertex sweep over {len(refs)} vertices of the final shape; "
-                "exact for planar-faced solids, curved faces may extend "
-                "beyond these bounds"
-                + (" (vertex count capped at 200)" if truncated else "")
-            ),
+        vertices = sum(b["vertices"] for _, b in boxes)
+        truncated = any(b["truncated"] for _, b in boxes)
+        method = (
+            f"vertex sweep over {vertices} vertices of the final shape; "
+            "exact for planar-faced solids, curved faces may extend "
+            "beyond these bounds"
+            + (" (vertex count capped at 200 per body)" if truncated else "")
+        )
+        if len(boxes) == 1 and not _is_all(body_name):
+            result = shaped(boxes[0][1])
+            result["body"] = boxes[0][0]
+            result["method"] = method
+            return json.dumps(result, indent=2)
+        union = {
+            "min": [min(b["min"][i] for _, b in boxes) for i in range(3)],
+            "max": [max(b["max"][i] for _, b in boxes) for i in range(3)],
         }
+        result = shaped(union)
+        result["bodies"] = [{"body": name, **shaped(box)} for name, box in boxes]
+        if self._skipped_operands:
+            result["skipped_boolean_operands"] = self._skipped_operands
+        result["method"] = method
         return json.dumps(result, indent=2)
 
     def _measure_element(self, name: str) -> str:
